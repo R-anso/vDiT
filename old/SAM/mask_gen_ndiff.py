@@ -2,6 +2,7 @@ import os
 import time
 import numpy as np
 import torch
+import math
 
 
 def _ensure_log_dir(log_dir: str) -> None:
@@ -17,6 +18,7 @@ def _log_run_summary(
     B_h: int,
     B_w: int,
     alpha: float,
+    beta: float,
 ) -> None:
     if not log_enabled:
         return
@@ -29,7 +31,8 @@ def _log_run_summary(
             f"  batch = {batch}\n"
             f"  B_h = {B_h}\n"
             f"  B_w = {B_w}\n"
-            f"  alpha = {alpha}\n\n"
+            f"  alpha = {alpha}\n"
+            f"  beta = {beta}\n\n"
         )
 
 
@@ -58,21 +61,17 @@ def generate_diff_sparse_mask(
     B_h: int,
     B_w: int,
     alpha: float,
+    beta: float,
     *,
     log_enabled: bool = False,
     log_dir: str = "./log",
+    mode: str = "ndiff",
 ) -> torch.Tensor:
     """
     基于层次差分逻辑生成稀疏掩码。
-
-    Args:
-        tensor: 输入张量，形状为 [Batch, B_hw, B_hw]。
-        B_h: 行向量划分的段数。
-        B_w: 每段的长度。
+    ...
         alpha: 阈值步长。
-
-    Returns:
-        shape 同输入的 bool 掩码张量。
+        beta: 每级段保留比例系数，范围 [0, 0.25]。
     """
     if tensor.ndim != 3:
         raise ValueError("tensor 需为 3 维张量 [Batch, B_hw, B_hw]")
@@ -85,6 +84,12 @@ def generate_diff_sparse_mask(
         raise ValueError(f"B_h * B_w 应等于列数 {num_cols}")
     if alpha <= 0:
         raise ValueError("alpha 必须为正数")
+    if not (0.0 <= beta <= 0.5):
+        raise ValueError("beta 需位于 [0, 0.5]")
+
+    mode = mode.lower()
+    if mode not in {"ndiff", "topk"}:
+        raise ValueError(f"mode 需为 'ndiff' 或 'topk'，得到 {mode}")
 
     _log_run_summary(
         log_enabled,
@@ -93,36 +98,61 @@ def generate_diff_sparse_mask(
         B_h=B_h,
         B_w=B_w,
         alpha=alpha,
+        beta=beta,
     )
 
     values = tensor.to(dtype=torch.float32)
     segments = values.reshape(batch_size, num_rows, B_h, B_w)
-    seg_max = segments.max(dim=-1).values
-    row_max = seg_max.max(dim=-1).values
-    residue = row_max.unsqueeze(-1) - seg_max
 
-    _maybe_log_matrix(log_enabled, log_dir, "seg_max", seg_max)
-    _maybe_log_matrix(log_enabled, log_dir, "row_max", row_max)
-    _maybe_log_matrix(log_enabled, log_dir, "residue", residue)
+    if mode == "ndiff":
+        segment_max = segments.max(dim=-1).values
+        row_max = segment_max.max(dim=-1, keepdim=True).values
+        diff = row_max - segment_max
 
-    arange_k = torch.arange(1, 5, device=values.device, dtype=values.dtype)
-    thresholds = seg_max.unsqueeze(-1) - float(alpha) * arange_k.view(1, 1, 1, 4)
-    masks_candidate = segments.unsqueeze(-2) >= thresholds.unsqueeze(-1)
+        grades = torch.zeros_like(diff, dtype=torch.int64)
+        grades = torch.where(diff <= alpha, torch.full_like(grades, 3), grades)
+        grades = torch.where(
+            (diff > alpha) & (diff <= 2 * alpha),
+            torch.full_like(grades, 2),
+            grades,
+        )
+        grades = torch.where(
+            (diff > 2 * alpha) & (diff <= 3 * alpha),
+            torch.full_like(grades, 1),
+            grades,
+        )
 
-    selection = torch.zeros_like(residue, dtype=torch.long)
-    selection = torch.where(residue <= alpha, torch.full_like(selection, 3), selection)
-    selection = torch.where((residue > alpha) & (residue <= 2 * alpha), torch.full_like(selection, 2), selection)
-    selection = torch.where((residue > 2 * alpha) & (residue <= 3 * alpha), torch.full_like(selection, 1), selection)
-    zero_mask = residue > (4 * alpha)
+        keep_counts = torch.ceil(grades.to(torch.float32) * float(beta) * B_w).to(torch.int64)
+        keep_counts = torch.clamp(keep_counts, max=B_w)
 
-    _maybe_log_matrix(log_enabled, log_dir, "selection", selection.float())
-    _maybe_log_matrix(log_enabled, log_dir, "zero_mask", zero_mask.float())
+        order = segments.argsort(dim=-1, descending=True)
+        ranks = torch.argsort(order, dim=-1)
+        segment_mask = ranks < keep_counts.unsqueeze(-1)
+        result = segment_mask.reshape(batch_size, num_rows, num_cols).to(dtype=torch.bool)
+        _maybe_log_matrix(log_enabled, log_dir, "segment_max", segment_max)
+        _maybe_log_matrix(log_enabled, log_dir, "row_max", row_max)
+        _maybe_log_matrix(log_enabled, log_dir, "diff", diff)
+        _maybe_log_matrix(log_enabled, log_dir, "grades", grades.to(torch.float32))
+        _maybe_log_matrix(log_enabled, log_dir, "keep_counts", keep_counts.to(torch.float32))
+    else:
+        keep_elems = int(math.ceil(beta * num_cols))
+        if keep_elems <= 0:
+            result = torch.zeros_like(values, dtype=torch.bool)
+        else:
+            keep_elems = min(keep_elems, num_cols)
+            topk_indices = torch.topk(values, k=keep_elems, dim=-1, largest=True).indices
+            result = torch.zeros_like(values, dtype=torch.bool)
+            result.scatter_(-1, topk_indices, True)
 
-    gather_index = selection.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, B_w)
-    selected = torch.gather(masks_candidate, dim=3, index=gather_index).squeeze(3)
-    selected = selected & (~zero_mask.unsqueeze(-1))
+        if log_enabled:
+            _maybe_log_matrix(log_enabled, log_dir, "rows_topk_values", values)
+            _maybe_log_matrix(
+                log_enabled,
+                log_dir,
+                "keep_elems_topk",
+                torch.full((1,), float(keep_elems), device=values.device),
+            )
 
-    result = selected.reshape(batch_size, num_rows, num_cols).to(dtype=torch.bool)
     _maybe_log_matrix(log_enabled, log_dir, "result_mask", result.float())
     return result
 
@@ -131,6 +161,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     B_h, B_w = 2, 3
     alpha = 0.05
+    beta = 0.25
     sample = torch.tensor(
         [
             [
@@ -144,6 +175,15 @@ if __name__ == "__main__":
         ],
         dtype=torch.float32,
     )
-    mask = generate_diff_sparse_mask(sample, B_h=B_h, B_w=B_w, alpha=alpha, log_enabled=True, log_dir="./log")
+    mask = generate_diff_sparse_mask(
+        sample,
+        B_h=B_h,
+        B_w=B_w,
+        alpha=alpha,
+        beta=beta,
+        log_enabled=True,
+        log_dir="./log",
+        mode='topk',
+    )
     print("输入：", sample)
     print("掩码：", mask.to(dtype=torch.uint8))
