@@ -101,23 +101,13 @@ class WanTI2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        
-        # [New] Extract recover config
-        # blueprint_dir = "./attn_analysis/3d_cluster_1024_MSE/blueprints"
-        blueprint_dir = None
-        # To disable, set blueprint_dir = None or set iter >50
-        recover_start_iter = 10
-        mag_en = False
-        parallelism = 1024
-        
-        self.model = WanModel.from_pretrained(
-            checkpoint_dir,
-            blueprint_dir=blueprint_dir,
-            recover_start_iter=recover_start_iter,
-            parallelism=parallelism,
-            mag_en=mag_en,
-        )
-        
+        self.model = WanModel.from_pretrained(checkpoint_dir)
+
+        #[new] 启用 RQT，必要时可下放到配置
+        self.model.rqt_enable = False
+        self.model.rqt_first_iter = 10
+        self.model.rqt_thetas = [5.0, 5.0, 5.0]
+
         self.model = self._configure_model(
             model=self.model,
             use_sp=use_sp,
@@ -180,10 +170,10 @@ class WanTI2V:
     def _build_attn_save_cfg(self, B_hw: int) -> Attn_Save_Cfg:
         """根据config.attn_save_cfg构建运行期注意力保存配置"""
         base_cfg = {
-            "enable": True,
+            "enable": {"Q": True, "K": True, "Score": True},
             "key": ["cond", "uncond"],
             "iter_idx": list(range(0, 50, 7)),
-            "layer_idx": list(range(self.model.num_layers)),
+            "layer_idx": list(range(10)),
             "head_idx": list(range(5)),
             "out_dir": "./attn_analysis/attn_score/F53_rope",
             "out_fmt": "pt",
@@ -408,6 +398,7 @@ class WanTI2V:
             # [new] 注意力保存配置
             B_hw = target_shape[2] * target_shape[3]
             attn_save_cfg = self._build_attn_save_cfg(B_hw)
+            self.model.rqt_states = {"cond": {}, "uncond": {}}
 
             # sample videos
             latents = noise

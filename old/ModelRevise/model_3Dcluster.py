@@ -10,9 +10,9 @@ from .attention import flash_attention
 
 # [new]
 from typing import List, Optional, Dict
-from SAM.attn_utils.attn_tools import Attn_Info, Attn_Save_Cfg
-from SAM.attn_utils.attn_tools import save_score
-from SAM.attn_utils.recover import ClusterRecover
+from SAM.attn_utils.attn_tools import Attn_Info, Attn_Save_Cfg, save_tensor
+# from SAM.attn_utils.recover import ClusterRecover
+from SAM.attn_utils.RQT import rope_quant_template, RQTState
 
 __all__ = ['WanModel']
 
@@ -144,8 +144,12 @@ class WanSelfAttention(nn.Module):
         grid_sizes,
         freqs,
         attn_info: Optional[Attn_Info] = None,
-        cluster_recover: Optional[ClusterRecover] = None,
         layer_idx: Optional[int] = None,
+        iter_idx: Optional[int] = None,
+        rqt_states: Optional[Dict[str, RQTState]] = None,
+        rqt_enable: bool = False,
+        rqt_first_iter: int = 10,
+        rqt_thetas: Optional[List[float]] = None,
     ):
         r"""
         Args:
@@ -170,65 +174,94 @@ class WanSelfAttention(nn.Module):
         q_rot = rope_apply(q, grid_sizes, freqs)
         k_rot = rope_apply(k, grid_sizes, freqs)
 
-        # [New] Blueprint Recovery Logic
-        if cluster_recover is not None and layer_idx is not None:
-            try:
-                # 准备输出容器 [B, S, N, D]
+        # [new] RQT 恢复路径
+        if rqt_enable and layer_idx is not None and iter_idx is not None and rqt_states is not None:
+            # try:
                 recovered_x = torch.zeros_like(q)
-                
-                # 遍历 Batch
-                for i in range(b):
-                    curr_len = int(seq_lens[i].item())
-                    if curr_len == 0: continue
-                    
-                    # 获取当前样本的维度信息
-                    curr_grid = grid_sizes[i].tolist() # [F, H, W]
-                    l_f, l_h, l_w = curr_grid[0], curr_grid[1], curr_grid[2]
-                    
-                    # 切片获取当前样本的 Q, K, V (使用 RoPE 后的 Q, K)
-                    q_sample = q_rot[i, :curr_len] # [L_i, N, D]
-                    k_sample = k_rot[i, :curr_len]
-                    v_sample = v[i, :curr_len]
-                    
-                    # 遍历 Heads
-                    for h_idx in range(n):
-                        # 1. 加载蓝图 (从内存缓存)
-                        cluster_info = cluster_recover.load_blueprint(layer_idx, h_idx)
-                        
-                        # 2. 准备数据
-                        q_h = q_sample[:, h_idx, :] # [L_i, D]
-                        k_h = k_sample[:, h_idx, :]
-                        v_h = v_sample[:, h_idx, :]
-                        
-                        # 3. 准备恢复所需中间变量
-                        prepared_data = cluster_recover.prepare_data(
-                            q_h, k_h, cluster_info, l_h, l_w, l_f
-                        )
-                        
-                        # 4. 恢复并计算 Attention * V
-                        out_h = cluster_recover.recover_matrix(
-                            *prepared_data, v_h, cluster_info, l_h, l_w, l_f
-                        ) # [L_i, D]
-                        
-                        # 填入结果
-                        recovered_x[i, :curr_len, h_idx, :] = out_h
+                d_splits = list(self._rope_component_dims)
+                rope_info = {"dims": ["f", "h", "w"], "d_splits": d_splits}
 
-                # 如果成功完成所有 Batch 和 Head，则直接输出
-                x = recovered_x.flatten(2)
-                x = self.o(x)
-                return x
+                # 分批处理头以减少显存开销
+                num_batches = 4
+                batch_size = n // num_batches  # 假设 num_heads 为偶数
 
-            except Exception as e:
-                # 如果恢复过程中出现任何错误（如缺少蓝图、维度不匹配等），回退到 Flash Attention
-                print(f"[WanSelfAttention] Recovery failed for L{layer_idx}: {e}. Fallback to Flash Attention.")
-                pass
+                for bi in range(q_rot.size(0)):
+                    curr_len = int(seq_lens[bi].item())
+                    if curr_len <= 0:
+                        continue
+                    l_f, l_h, l_w = grid_sizes[bi].tolist()
+                    size_info = {"l_f": l_f, "l_h": l_h, "l_w": l_w}
 
+                    # 堆叠所有head的QKV，按head维度处理
+                    Q_batch = q_rot[bi, :curr_len, :, :].transpose(0, 1)  # [num_heads, L, D]
+                    K_batch = k_rot[bi, :curr_len, :, :].transpose(0, 1)
+                    V_batch = v[bi, :curr_len, :, :].transpose(0, 1)
+
+                    if iter_idx == rqt_first_iter:
+                        # 首轮：为每批头建立聚类状态
+                        for i in range(num_batches):
+                            start = i * batch_size
+                            end = (i + 1) * batch_size
+                            Q_sub = Q_batch[start:end]
+                            K_sub = K_batch[start:end]
+                            V_sub = V_batch[start:end]
+                            sub_key = f"{layer_idx}:{bi}:batch{i}"
+                            new_state, _ = rope_quant_template(
+                                Q=Q_sub, K=K_sub, V=V_sub,
+                                thetas=(rqt_thetas or [5.0, 5.0, 5.0]),
+                                Nc=512, M=8,
+                                rope_info=rope_info,
+                                size_info=size_info,
+                                force_merge=True,
+                            )
+                            rqt_states[sub_key] = new_state
+                        continue
+                    else:
+                        # 后续：为每批头刷新状态并近似计算
+                        O_list = []
+                        for i in range(num_batches):
+                            start = i * batch_size
+                            end = (i + 1) * batch_size
+                            Q_sub = Q_batch[start:end]
+                            K_sub = K_batch[start:end]
+                            V_sub = V_batch[start:end]
+                            sub_key = f"{layer_idx}:{bi}:batch{i}"
+                            state_sub = rqt_states.get(sub_key)
+                            if state_sub is None:
+                                # 如果状态缺失，跳过或回退
+                                continue
+                            new_state, O_sub = rope_quant_template(
+                                Q=Q_sub, K=K_sub, V=V_sub,
+                                thetas=None,
+                                rope_info=rope_info,
+                                size_info=size_info,
+                                state=state_sub,
+                            )
+                            rqt_states[sub_key] = new_state
+                            O_list.append(O_sub)
+                        if len(O_list) == num_batches:
+                            O = torch.cat(O_list, dim=0)  # [num_heads, L, V_dim]
+                            # 转回 [L, num_heads, V_dim]
+                            O = O.transpose(0, 1)
+                            recovered_x[bi, :curr_len, :, :] = O
+
+                if iter_idx > rqt_first_iter:
+                    x = recovered_x.flatten(2)
+                    x = self.o(x)
+                    return x
+
+            # except Exception as e:
+            #     print(f"[WanSelfAttention] RQT failed L{layer_idx} it{iter_idx}: {e}. Fallback to Flash.")
+            #     pass
+
+        # Flash Attention 路径（默认）
         x = flash_attention(
             q=q_rot,
             k=k_rot,
             v=v,
             k_lens=seq_lens,
-            window_size=self.window_size)
+            window_size=self.window_size,
+        )
 
         if attn_info is not None:
             self._compute_and_save_attn(q_rot, k_rot, seq_lens, attn_info)
@@ -240,9 +273,24 @@ class WanSelfAttention(nn.Module):
 
     # [new]
     def _compute_and_save_attn(self, q, k, seq_lens, attn_info):
-        block_size = attn_info.B_hw or 0
-        if block_size <= 0 or not attn_info.head_idx:
+        # 1. 检查保存开关
+        save_q = attn_info.should_save("q")
+        save_k = attn_info.should_save("k")
+        save_score = attn_info.should_save("score")
+
+        if not (save_q or save_k or save_score):
             return
+        
+        if not attn_info.head_idx:
+            return
+
+        block_size = attn_info.B_hw or 0
+        # 如果只存 Q/K，block_size 可以忽略；如果存 Score，block_size 必须 > 0
+        if save_score and block_size <= 0:
+            # 无法计算 Score，降级为只存 Q/K (如果启用)
+            save_score = False
+            if not (save_q or save_k):
+                return
 
         scale = 1.0 / math.sqrt(self.head_dim)
         component_dims = self._rope_component_dims
@@ -257,72 +305,121 @@ class WanSelfAttention(nn.Module):
             q_slice = q[batch_idx, :target_len]
             k_slice = k[batch_idx, :target_len]
 
-            for head_idx in range(self.num_heads):
+            for head_idx in attn_info.head_idx:
                 if not attn_info.check_save_en(head_idx):
                     continue
 
                 rope_order = attn_info.get_rope_order()
                 use_components = bool(rope_order)
-                if use_components:
-                    component_buffers = {
-                        key: torch.empty((target_len, target_len), dtype=q.dtype, device="cpu")
-                        for key in canonical_tokens
-                    }
-                else:
-                    attn_matrix = torch.empty(
-                        (target_len, target_len), dtype=q.dtype, device="cpu"
-                    )
+                tokens = [tok for tok in rope_order.split("-") if tok] if use_components else []
 
-                row_start = 0
-                while row_start < target_len:
-                    row_end = min(row_start + block_size, target_len)
-                    q_chunk = q_slice[row_start:row_end, head_idx]
+                q_head = q_slice[:, head_idx]
+                k_head = k_slice[:, head_idx]
 
-                    col_start = 0
-                    while col_start < target_len:
-                        col_end = min(col_start + block_size, target_len)
-                        k_chunk = k_slice[col_start:col_end, head_idx]
+                # --- 保存 Q ---
+                if save_q:
+                    fname_q = attn_info.get_fname(this_head=head_idx, name="Q")
+                    if use_components:
+                        # 传入原始 q_head 和 component_dims，让 save_tensor 内部处理分割
+                        save_tensor(
+                            q_head,
+                            out_dir=out_dir,
+                            out_fmt=attn_info.out_fmt,
+                            fname_template=fname_q,
+                            rope_order=rope_order,
+                            component_dims=component_dims,
+                        )
+                    else:
+                        save_tensor(
+                            q_head,
+                            out_dir=out_dir,
+                            out_fmt=attn_info.out_fmt,
+                            fname_template=fname_q,
+                        )
 
-                        if use_components:
-                            q_f, q_h, q_w = torch.split(q_chunk, component_dims, dim=-1)
-                            k_f, k_h, k_w = torch.split(k_chunk, component_dims, dim=-1)
+                # --- 保存 K ---
+                if save_k:
+                    fname_k = attn_info.get_fname(this_head=head_idx, name="K")
+                    if use_components:
+                        # 传入原始 k_head 和 component_dims
+                        save_tensor(
+                            k_head,
+                            out_dir=out_dir,
+                            out_fmt=attn_info.out_fmt,
+                            fname_template=fname_k,
+                            rope_order=rope_order,
+                            component_dims=component_dims,
+                        )
+                    else:
+                        save_tensor(
+                            k_head,
+                            out_dir=out_dir,
+                            out_fmt=attn_info.out_fmt,
+                            fname_template=fname_k,
+                        )
 
-                            blocks = {
-                                "f": torch.matmul(q_f, k_f.transpose(0, 1)) * scale,
-                                "h": torch.matmul(q_h, k_h.transpose(0, 1)) * scale,
-                                "w": torch.matmul(q_w, k_w.transpose(0, 1)) * scale,
-                            }
-                            for key, block in blocks.items():
-                                component_buffers[key][
-                                    row_start:row_end, col_start:col_end
-                                ] = block.cpu()
-                        else:
-                            block_partial = torch.matmul(
-                                q_chunk, k_chunk.transpose(0, 1)
-                            ) * scale
-                            attn_matrix[row_start:row_end, col_start:col_end] = block_partial.cpu()
+                # --- 保存 Score ---
+                if save_score:
+                    if use_components:
+                        component_buffers = {
+                            key: torch.empty((target_len, target_len), dtype=q.dtype, device="cpu")
+                            for key in canonical_tokens
+                        }
+                    else:
+                        attn_matrix = torch.empty(
+                            (target_len, target_len), dtype=q.dtype, device="cpu"
+                        )
 
-                        col_start = col_end
-                    row_start = row_end
+                    row_start = 0
+                    while row_start < target_len:
+                        row_end = min(row_start + block_size, target_len)
+                        q_chunk = q_head[row_start:row_end]
 
-                fname_template = attn_info.get_fname(this_head=head_idx)
-                if use_components:
-                    tokens = [tok for tok in rope_order.split("-") if tok]
-                    stacked = torch.stack([component_buffers[token] for token in tokens], dim=0)
-                    save_score(
-                        stacked,
-                        out_dir=out_dir,
-                        out_fmt=attn_info.out_fmt,
-                        fname_template=fname_template,
-                        rope_order=rope_order,
-                    )
-                else:
-                    save_score(
-                        attn_matrix,
-                        out_dir=out_dir,
-                        out_fmt=attn_info.out_fmt,
-                        fname_template=fname_template,
-                    )
+                        col_start = 0
+                        while col_start < target_len:
+                            col_end = min(col_start + block_size, target_len)
+                            k_chunk = k_head[col_start:col_end]
+
+                            if use_components:
+                                q_f, q_h, q_w = torch.split(q_chunk, component_dims, dim=-1)
+                                k_f, k_h, k_w = torch.split(k_chunk, component_dims, dim=-1)
+
+                                blocks = {
+                                    "f": torch.matmul(q_f, k_f.transpose(0, 1)) * scale,
+                                    "h": torch.matmul(q_h, k_h.transpose(0, 1)) * scale,
+                                    "w": torch.matmul(q_w, k_w.transpose(0, 1)) * scale,
+                                }
+                                for key, block in blocks.items():
+                                    component_buffers[key][
+                                        row_start:row_end, col_start:col_end
+                                    ] = block.cpu()
+                            else:
+                                block_partial = torch.matmul(
+                                    q_chunk, k_chunk.transpose(0, 1)
+                                ) * scale
+                                attn_matrix[row_start:row_end, col_start:col_end] = block_partial.cpu()
+
+                            col_start = col_end
+                        row_start = row_end
+
+                    fname_score = attn_info.get_fname(this_head=head_idx, name="score")
+                    if use_components:
+                        # Score 矩阵维度一致，可以 stack，不需要 component_dims
+                        stacked = torch.stack([component_buffers[token] for token in tokens], dim=0)
+                        save_tensor(
+                            stacked,
+                            out_dir=out_dir,
+                            out_fmt=attn_info.out_fmt,
+                            fname_template=fname_score,
+                            rope_order=rope_order,
+                        )
+                    else:
+                        save_tensor(
+                            attn_matrix,
+                            out_dir=out_dir,
+                            out_fmt=attn_info.out_fmt,
+                            fname_template=fname_score,
+                        )
 
 
 class WanCrossAttention(WanSelfAttention):
@@ -396,8 +493,12 @@ class WanAttentionBlock(nn.Module):
         context,
         context_lens,
         attn_info: Optional[Attn_Info] = None,
-        cluster_recover: Optional[ClusterRecover] = None,
         layer_idx: Optional[int] = None,
+        iter_idx: Optional[int] = None,
+        rqt_states: Optional[Dict[str, RQTState]] = None,
+        rqt_enable: bool = False,
+        rqt_first_iter: int = 10,
+        rqt_thetas: Optional[List[float]] = None,
     ):
         r"""
         Args:
@@ -416,12 +517,16 @@ class WanAttentionBlock(nn.Module):
         # [new] self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens,
-            grid_sizes,
-            freqs,
-            attn_info,
-            cluster_recover=cluster_recover,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            attn_info=attn_info,
             layer_idx=layer_idx,
+            iter_idx=iter_idx,
+            rqt_states=rqt_states,
+            rqt_enable=rqt_enable,
+            rqt_first_iter=rqt_first_iter,
+            rqt_thetas=rqt_thetas,
         )
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
@@ -498,10 +603,10 @@ class WanModel(ModelMixin, ConfigMixin):
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6,
-                 blueprint_dir: Optional[str] = None,
-                 recover_start_iter: int = 10,
-                 parallelism: int = 1024,
-                 mag_en: bool = False):
+                 rqt_enable: bool = False,
+                 rqt_first_iter: int = 10,
+                 rqt_thetas: Optional[List[float]] = None,
+                 ):
         r"""
         Initialize the diffusion model backbone.
 
@@ -558,20 +663,13 @@ class WanModel(ModelMixin, ConfigMixin):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
-        # [New] Initialize Recover Managers
-        self.recover_start_iter = recover_start_iter
-        self.recover_managers: Dict[str, ClusterRecover] = {}
+        # [new] RQT 相关参数
+        self.rqt_enable = rqt_enable
+        self.rqt_first_iter = rqt_first_iter
+        self.rqt_thetas = rqt_thetas or [5.0, 5.0, 5.0]
+        # 每个分支维护独立的状态字典
+        self.rqt_states: Dict[str, Dict[str, RQTState]] = {"cond": {}, "uncond": {}}
 
-        if blueprint_dir:
-            import os
-            for key in ['cond', 'uncond']:
-                sub_dir = os.path.join(blueprint_dir, key)
-                if os.path.exists(sub_dir):
-                    print(f"[WanModel] Initializing ClusterRecover for '{key}' from {sub_dir}")
-                    # preload_all=True to load all blueprints into CPU RAM
-                    self.recover_managers[key] = ClusterRecover(sub_dir, recover_enabled=True, preload_all=True, parallelism=parallelism, mag_en=mag_en)
-                else:
-                    print(f"[WanModel] Warning: Blueprint subdir {sub_dir} not found.")
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -701,21 +799,25 @@ class WanModel(ModelMixin, ConfigMixin):
                 iter_idx=iter_idx,
                 layer_idx=layer_idx,
             )
-            
-            # [New] Select Recover Manager
-            cluster_recover = None
-            if (self.recover_managers 
-                and iter_idx is not None 
-                and iter_idx >= self.recover_start_iter
-                and key in self.recover_managers):
-                cluster_recover = self.recover_managers[key]
+
+            # 选择当前分支的 RQT 状态字典
+            branch_states = self.rqt_states.get(key or "", {})
 
             x = block(
                 x,
+                e=e0,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                freqs=self.freqs,
+                context=context,
+                context_lens=context_lens,
                 attn_info=attn_info,
-                **kwargs,
-                cluster_recover=cluster_recover,
                 layer_idx=layer_idx,
+                iter_idx=iter_idx,
+                rqt_states=branch_states,
+                rqt_enable=self.rqt_enable,
+                rqt_first_iter=self.rqt_first_iter,
+                rqt_thetas=self.rqt_thetas,
             )
 
         # head
@@ -785,7 +887,7 @@ class WanModel(ModelMixin, ConfigMixin):
         """若配置允许当前层保存注意力，则构造 Attn_Info"""
         if (
             attn_save_cfg is None
-            or not attn_save_cfg.enable
+            or not attn_save_cfg.any_enabled()
             or key is None
             or iter_idx is None
             or not attn_save_cfg.check_save_en(key, iter_idx, layer_idx)
@@ -805,4 +907,5 @@ class WanModel(ModelMixin, ConfigMixin):
             out_dir=attn_save_cfg.out_dir,
             out_fmt=attn_save_cfg.out_fmt,
             rope_order=attn_save_cfg.get_rope_order(),
+            enable_map=attn_save_cfg.get_enable_map(),
         )
