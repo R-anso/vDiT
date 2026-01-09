@@ -166,14 +166,14 @@ class WanTI2V:
     def _build_attn_save_cfg(self, B_hw: int) -> Attn_Save_Cfg:
         """根据config.attn_save_cfg构建运行期注意力保存配置"""
         base_cfg = {
-            "enable": {"Q": True, "K": True, "Score": False},
+            "enable": {"Q": False, "K": False, "Score": False},
             "key": ["cond", "uncond"],
             "iter_idx": list(range(0, 50, 7)),
             "layer_idx": list(range(self.model.num_layers)),
             "head_idx": list(range(5)),
             "out_dir": "./attn_analysis/attn_score/F53",
             "out_fmt": "pt",
-            "rope_order": "f-h-w",
+            "rope_order": None,
         }
         user_cfg = getattr(self.config, "attn_save_cfg", None)
         if user_cfg:
@@ -201,14 +201,16 @@ class WanTI2V:
         """根据config.attn_cluster_cfg构建运行期注意力聚类配置"""
         base_cfg = {
             "enable": True,
-            "q_cf": 2, "q_ch": 2, "q_cw": 2, "q_threshold": 0.9,
-            "k_cf": 2, "k_ch": 2, "k_cw": 2, "k_threshold": 0.95,
-            "check_point_interval": 5,
-            "quantize": True,  # 默认开启量化模拟
-            "skip_start_iters": 2,  
+            "q_cf": 1, "q_ch": 2, "q_cw": 2, "q_threshold": 0.90,
+            "k_cf": 1, "k_ch": 2, "k_cw": 2, "k_threshold": 0.90,
+            "check_point_interval": 3,
+            "quantize": True,
+            "res_compensate": True,
+            "skip_start_iters": 3,  
             "skip_end_iters": 2,
             "total_steps": sampling_steps,
             "out_dir": "./attn_analysis/cluster_results",
+            "save_pic": False,
         }
         user_cfg = getattr(self.config, "attn_cluster_cfg", None)
         if user_cfg:

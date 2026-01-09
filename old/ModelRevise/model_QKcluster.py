@@ -177,6 +177,7 @@ class WanSelfAttention(nn.Module):
             cfg = attn_cluster_manager.cfg
             
             q_list, k_list = [], []
+            q_res_list, k_res_list = [], []
             for h_idx in range(n):
                 qh = q_rot[0, :, h_idx, :]
                 kh = k_rot[0, :, h_idx, :]
@@ -187,8 +188,18 @@ class WanSelfAttention(nn.Module):
                 masks = attn_cluster_manager.get_masks(layer_idx, h_idx)
                 if masks is not None:
                     q_mask, k_mask = masks['Q'], masks['K']
-                    qh_clustered = attn_cluster_manager.apply_clustering(qh, sizes, q_mask, cfg.q_cf, cfg.q_ch, cfg.q_cw)
-                    kh_clustered = attn_cluster_manager.apply_clustering(kh, sizes, k_mask, cfg.k_cf, cfg.k_ch, cfg.k_cw)
+                    
+                    q_out = attn_cluster_manager.apply_clustering(qh, sizes, q_mask, cfg.q_cf, cfg.q_ch, cfg.q_cw)
+                    k_out = attn_cluster_manager.apply_clustering(kh, sizes, k_mask, cfg.k_cf, cfg.k_ch, cfg.k_cw)
+
+                    if cfg.res_compensate:
+                        qh_clustered, qh_res = q_out
+                        kh_clustered, kh_res = k_out
+                        q_res_list.append(qh_res)
+                        k_res_list.append(kh_res)
+                    else:
+                        qh_clustered = q_out
+                        kh_clustered = k_out
                     
                     q_ratio = q_mask.float().mean().item()
                     k_ratio = k_mask.float().mean().item()
@@ -199,18 +210,56 @@ class WanSelfAttention(nn.Module):
                 else:
                     q_list.append(qh)
                     k_list.append(kh)
+                    if cfg.res_compensate:
+                        q_res_list.append(torch.zeros_like(qh))
+                        k_res_list.append(torch.zeros_like(kh))
             
             q_rot = torch.stack(q_list, dim=1).unsqueeze(0)
             k_rot = torch.stack(k_list, dim=1).unsqueeze(0)
+            if cfg.res_compensate:
+                q_res = torch.stack(q_res_list, dim=1).unsqueeze(0)
+                k_res = torch.stack(k_res_list, dim=1).unsqueeze(0)
 
-        # Flash Attention 路径（默认）
-        x = flash_attention(
-            q=q_rot,
-            k=k_rot,
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size,
-        )
+        # Attention calculation
+        if attn_cluster_manager is not None and attn_cluster_manager.is_active_iter(iter_idx) and cfg.res_compensate:
+            # Step 5: Res Value compensate
+            # 原理优化：将 (Q_orig @ K_base^T + Q_base @ K_res^T) 
+            # 转化为单个拼接矩阵的注意力计算，从而使用 Flash Attention 节省显存
+            
+            # 1. 在 head_dim 维度(dim=-1)拼接
+            # q_orig, q_base, k_base, k_res 形状均为 [B, L, N, D]
+            q_combined = torch.cat([q_rot + q_res, q_rot], dim=-1) # [B, L, N, 2D]
+            k_combined = torch.cat([k_rot, k_res], dim=-1)         # [B, L, N, 2D]
+            
+            # 2. 转换为 Flash Attention 要求的格式 [B, N, L, D_new]
+            q_combined = q_combined.transpose(1, 2)
+            k_combined = k_combined.transpose(1, 2)
+            v_t = v.transpose(1, 2) # [B, N, L, D]
+            
+            # 3. 使用 PyTorch 内置的闪电注意力（自动选择 FlashAttention 或 MemoryEfficientAttention）
+            # 注意：scale 必须设为原来的 1/sqrt(d)，而不是 1/sqrt(2d)
+            scale = 1.0 / math.sqrt(self.head_dim)
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q_combined, 
+                k_combined, 
+                v_t, 
+                attn_mask=None, 
+                dropout_p=0.0, 
+                is_causal=False, 
+                scale=scale
+            )
+            
+            # 4. 还原形状 [B, N, L, D] -> [B, L, N, D]
+            x = x.transpose(1, 2)
+        else:
+            # Flash Attention 路径（默认或 Step 4）
+            x = flash_attention(
+                q=q_rot,
+                k=k_rot,
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size,
+            )
 
         if attn_info is not None:
             self._compute_and_save_attn(q_rot, k_rot, seq_lens, attn_info)
