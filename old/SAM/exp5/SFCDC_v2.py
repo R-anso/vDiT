@@ -1,8 +1,7 @@
-# version 2.0
-# 支持多GPU
 import torch
 import torch.nn.functional as F
 import math
+import threading
 
 class SFCDC_Simulator:
     def __init__(self, enabled=False, start_iter=2, end_iter=45, centers=256, group_size=4, k0=0.02, k1=0.08, k2=0.15, l_f=16, l_h=16, l_w=16):
@@ -11,9 +10,9 @@ class SFCDC_Simulator:
         self.end_iter = end_iter
         self.centers = centers        
         self.group_size = group_size  
-        self.k0 = k0                  # Tier 1: 全值计算比例 (Exact)
-        self.k1 = k1                  # Tier 2: 差分补偿比例 (Diff)
-        self.k2 = k2                  # Tier 3: 仅质心比例 (Centroid)
+        self.k0 = k0
+        self.k1 = k1
+        self.k2 = k2
         
         self.l_f = l_f                
         self.l_h = l_h                
@@ -28,143 +27,150 @@ class SFCDC_Simulator:
         total_tokens = min(L, F_dim * H_dim * W_dim)
         device, dtype = q.device, q.dtype
 
-        # 整理维度并准备量化
+        # 整理维度
         q_all = q.transpose(1, 2).reshape(-1, L, D)[:, :total_tokens]
         k_all = k.transpose(1, 2).reshape(-1, L, D)[:, :total_tokens]
         v_all = v.transpose(1, 2).reshape(-1, L, D)[:, :total_tokens]
         B_all = q_all.size(0)
         curr_L = q_all.size(1)
 
-        # 1. 差异化量化：Q (Block-wise), K (Token-wise)
+        # 1. 显存优化：使用 int8 存储量化后的数据 [Save 75% VRAM for these buffers]
         q_int, q_s_inv = self._quantize_batch_blockwise(q_all, F_dim, H_dim, W_dim)
         k_int, k_s_inv = self._quantize_tokenwise(k_all)
-        
-        # 阶段 A: 背景训练期
+        q_int, k_int = q_int.to(torch.int8), k_int.to(torch.int8)
+
+        num_gpus = torch.cuda.device_count()
+        gpu_splits = []
+        heads_per_gpu = (B_all + num_gpus - 1) // num_gpus
+        for i in range(num_gpus):
+            start, end = i * heads_per_gpu, min((i+1) * heads_per_gpu, B_all)
+            if start < end:
+                gpu_splits.append((start, end, torch.device(f"cuda:{i}")))
+
         if iter_idx < self.start_iter:
             sq_all = self._expand_scale(q_s_inv, F_dim, H_dim, W_dim)[:, :curr_L].unsqueeze(-1)
             sk_all = k_s_inv.unsqueeze(-1)
             
-            for i in range(B_all):
-                meta_key = (key, layer_idx, i % N)
-                self.offline_meta[meta_key] = self._run_offline_clustering(
-                    q_int[i].to(dtype) * sq_all[i], k_int[i].to(dtype) * sk_all[i],
-                    F_dim, H_dim, W_dim, prev_meta=self.offline_meta.get(meta_key)
-                )
+            def train_worker(start, end, target_dev):
+                for i in range(start, end):
+                    # 转换回 dtype 进行计算
+                    qi = (q_int[i].to(target_dev, dtype=dtype) * sq_all[i].to(target_dev))
+                    ki = (k_int[i].to(target_dev, dtype=dtype) * sk_all[i].to(target_dev))
+                    res = self._run_offline_clustering(qi, ki, F_dim, H_dim, W_dim, device=target_dev)
+                    res["centroids_q"] = res["centroids_q"].to("cpu")
+                    res["centroids_k"] = res["centroids_k"].to("cpu")
+                    self.offline_meta[(key, layer_idx, i % N)] = res
+
+            threads = [threading.Thread(target=train_worker, args=s) for s in gpu_splits]
+            for t in threads: t.start()
+            for t in threads: t.join()
             return None
 
         if iter_idx > self.end_iter: return None
 
-        # 阶段 C: 加速推理期 (先更新质心数值，再计算加速)
-        C_Q_prev = torch.stack([self.offline_meta[(key, layer_idx, i % N)]["centroids_q"] for i in range(B_all)])
-        C_K_prev = torch.stack([self.offline_meta[(key, layer_idx, i % N)]["centroids_k"] for i in range(B_all)])
-
+        # 阶段 C: 加速推理
         out_all = torch.empty_like(q_all)
         inv_sqrt_d = 1.0 / math.sqrt(D)
-        chunk_size = 4
 
-        for s_b in range(0, B_all, chunk_size):
-            e_b = min(s_b + chunk_size, B_all)
-            cur_B = e_b - s_b
+        def inference_worker(start_b, end_b, target_dev):
+            # [显存优化] 直接从 CPU 字典加载质心，不经过 cuda:0 全量堆叠
+            sl_CQ = torch.stack([self.offline_meta[(key, layer_idx, i % N)]["centroids_q"] for i in range(start_b, end_b)]).to(target_dev)
+            sl_CK = torch.stack([self.offline_meta[(key, layer_idx, i % N)]["centroids_k"] for i in range(start_b, end_b)]).to(target_dev)
             
-            c_qi_int, c_ki_int = q_int[s_b:e_b], k_int[s_b:e_b]
-            c_si_q, c_si_k = q_s_inv[s_b:e_b], k_s_inv[s_b:e_b]
-            
-            # A. 在线重分配 (仅返回 L1 距离映射标签)
-            c_LQ = self._reassign_clusters_online(c_qi_int, C_Q_prev[s_b:e_b], F_dim, H_dim, W_dim)
-            c_LK = self._reassign_clusters_online(c_ki_int, C_K_prev[s_b:e_b], F_dim, H_dim, W_dim)
-            
-            # B. 质心更新 (全量 Token 取均值)
-            def compute_cluster_means(data, labels):
-                B, L, D = data.shape
-                means = torch.zeros((B, self.centers, D), device=device, dtype=dtype)
-                counts = torch.zeros((B, self.centers, 1), device=device, dtype=dtype)
-                means.scatter_add_(1, labels.unsqueeze(-1).expand(-1, -1, D), data.to(dtype))
-                counts.scatter_add_(1, labels.unsqueeze(-1), torch.ones_like(labels).unsqueeze(-1).to(dtype))
-                return (means / counts.clamp(min=1)).round(), counts
+            sl_qi = q_int[start_b:end_b].to(target_dev)
+            sl_ki = k_int[start_b:end_b].to(target_dev)
+            sl_si_q = q_s_inv[start_b:end_b].to(target_dev)
+            sl_si_k = k_s_inv[start_b:end_b].to(target_dev)
+            sl_v = v_all[start_b:end_b].to(target_dev, dtype=dtype)
 
-            QC_I, _ = compute_cluster_means(c_qi_int, c_LQ)
-            KC_I, KC_counts = compute_cluster_means(c_ki_int, c_LK)
-            
-            # C. 簇级幅度修正 (KC_scale)
-            # 计算分配到每个簇的 Token Scale 的平均值
-            kc_scales_sum = torch.zeros((cur_B, self.centers, 1), device=device, dtype=dtype)
-            kc_scales_sum.scatter_add_(1, c_LK.unsqueeze(-1), c_si_k.unsqueeze(-1).to(dtype))
-            ks_c = (kc_scales_sum / KC_counts.clamp(min=1))
+            chunk_size = 4
+            for s in range(0, end_b - start_b, chunk_size):
+                e = min(s + chunk_size, end_b - start_b)
+                # 执行核心计算 (此时 qi/ki 仍是 int8)
+                res, n_cq, n_ck = self._compute_core(
+                    sl_qi[s:e], sl_ki[s:e], sl_v[s:e],
+                    sl_si_q[s:e], sl_si_k[s:e], sl_CQ[s:e], sl_CK[s:e],
+                    target_dev, dtype, inv_sqrt_d, F_dim, H_dim, W_dim, curr_L
+                )
+                out_all[start_b + s : start_b + e].copy_(res, non_blocking=True)
+                # 质心存回 CPU
+                for i in range(s, e):
+                    idx = start_b + i
+                    self.offline_meta[(key, layer_idx, idx % N)]["centroids_q"] = n_cq[i-s].to("cpu")
+                    self.offline_meta[(key, layer_idx, idx % N)]["centroids_k"] = n_ck[i-s].to("cpu")
 
-            n_g = c_si_q.size(1)
-            k_base, k_rem = self.centers // n_g, self.centers % n_g
-            k_repeats = torch.full((n_g,), k_base, device=device)
-            k_repeats[:k_rem] += 1
-            
-            qs_c = torch.repeat_interleave(c_si_q.to(dtype), k_repeats, dim=1).unsqueeze(-1)
-            
-            # D. 加速推理
-            # 显式强制质心得分矩阵为 dtype
-            sc = torch.bmm((QC_I * qs_c).to(dtype), (KC_I * ks_c).transpose(1, 2).to(dtype)) * inv_sqrt_d
-            sc_idx = torch.sort(sc, dim=-1, descending=True)[1]
-            
-            c0, c1, c2 = int(self.k0*self.centers), int(self.k1*self.centers), int(self.k2*self.centers)
-            q_s_full = self._expand_scale(c_si_q, F_dim, H_dim, W_dim)[:, :curr_L].to(dtype)
-            k_s_full = c_si_k.to(dtype)
-            
-            s = torch.full((cur_B, curr_L, curr_L), -10000.0, device=device, dtype=dtype)
-
-            # Tier 1: Exact
-            m_e_base = torch.zeros_like(sc, dtype=torch.bool).scatter_(2, sc_idx[:, :, :c0], True)
-            m_e = m_e_base.gather(1, c_LQ.unsqueeze(-1).expand(-1, -1, self.centers)).gather(2, c_LK.unsqueeze(1).expand(-1, curr_L, -1))
-            del m_e_base
-            
-            res_e = torch.bmm(c_qi_int.to(dtype), c_ki_int.to(dtype).transpose(1, 2))
-            b_idx, r_idx, c_idx = m_e.nonzero(as_tuple=True)
-            res_e_m = res_e[b_idx, r_idx, c_idx]
-            scale_m = q_s_full[b_idx, r_idx] * k_s_full[b_idx, c_idx] * inv_sqrt_d
-            s[b_idx, r_idx, c_idx] = (res_e_m * scale_m).to(dtype)
-            del m_e, res_e, b_idx, r_idx, c_idx, res_e_m, scale_m
-
-            # Tier 3: Centroid (直接从 sc 获取，避免实例化 L*L 的 sc_exp)
-            m_c_base = torch.zeros_like(sc, dtype=torch.bool).scatter_(2, sc_idx[:, :, c0+c1:c0+c1+c2], True)
-            m_c = m_c_base.gather(1, c_LQ.unsqueeze(-1).expand(-1, -1, self.centers)).gather(2, c_LK.unsqueeze(1).expand(-1, curr_L, -1))
-            del m_c_base
-            
-            b_idx, r_idx, c_idx = m_c.nonzero(as_tuple=True)
-            q_c_ids = c_LQ[b_idx, r_idx]
-            k_c_ids = c_LK[b_idx, c_idx]
-            s[b_idx, r_idx, c_idx] = sc[b_idx, q_c_ids, k_c_ids].to(dtype)
-            del m_c, b_idx, r_idx, c_idx, q_c_ids, k_c_ids
-
-            # Tier 2: Diff
-            m_d_base = torch.zeros_like(sc, dtype=torch.bool).scatter_(2, sc_idx[:, :, c0:c0+c1], True)
-            m_d = m_d_base.gather(1, c_LQ.unsqueeze(-1).expand(-1, -1, self.centers)).gather(2, c_LK.unsqueeze(1).expand(-1, curr_L, -1))
-            del m_d_base
-
-            qc_t = torch.gather(QC_I, 1, c_LQ.unsqueeze(-1).expand(-1, -1, D))
-            kc_t = torch.gather(KC_I, 1, c_LK.unsqueeze(-1).expand(-1, -1, D))
-            q_diff = (c_qi_int.to(dtype) - qc_t)
-            k_diff = (c_ki_int.to(dtype) - kc_t)
-            del qc_t, kc_t
-
-            res_d = torch.bmm(QC_I, KC_I.transpose(1, 2)).gather(1, c_LQ.unsqueeze(-1).expand(-1,-1,self.centers)).gather(2, c_LK.unsqueeze(1).expand(-1,curr_L,-1))
-            t2 = torch.bmm(q_diff, KC_I.transpose(1, 2)).gather(2, c_LK.unsqueeze(1).expand(-1,curr_L,-1))
-            res_d.add_(t2); del t2
-            t3 = torch.bmm(QC_I, k_diff.transpose(1, 2)).gather(1, c_LQ.unsqueeze(-1).expand(-1,-1,curr_L))
-            res_d.add_(t3); del t3, q_diff, k_diff
-            
-            b_idx, r_idx, c_idx = m_d.nonzero(as_tuple=True)
-            res_d_m = res_d[b_idx, r_idx, c_idx]
-            scale_m = q_s_full[b_idx, r_idx] * k_s_full[b_idx, c_idx] * inv_sqrt_d
-            s[b_idx, r_idx, c_idx] = (res_d_m * scale_m).to(dtype)
-            del m_d, res_d, b_idx, r_idx, c_idx, res_d_m, scale_m
-            
-            out_all[s_b:e_b] = torch.bmm(F.softmax(s, dim=-1), v_all[s_b:e_b].to(dtype))
-            
-            # 更新状态池
-            for i in range(s_b, e_b):
-                self.offline_meta[(key, layer_idx, i % N)]["centroids_q"] = QC_I[i-s_b].detach()
-                self.offline_meta[(key, layer_idx, i % N)]["centroids_k"] = KC_I[i-s_b].detach()
-
-            del s, sc, sc_idx, QC_I, KC_I, c_LQ, c_LK
+        threads = [threading.Thread(target=inference_worker, args=s) for s in gpu_splits]
+        for t in threads: t.start()
+        for t in threads: t.join()
 
         return out_all.reshape(B, N, curr_L, D).transpose(1, 2)
+
+    def _compute_core(self, qi, ki, vi, si_q, si_k, CQ, CK, device, dtype, inv_sqrt_d, F_dim, H_dim, W_dim, L):
+        """完全约束在单个 device 上的核心计算函数"""
+        B_slice = qi.size(0)
+        D_dim = qi.size(2)
+        qi_f, ki_f = qi.to(dtype), ki.to(dtype)
+        
+        c_LQ = self._reassign_clusters_online(qi_f, CQ, F_dim, H_dim, W_dim)
+        c_LK = self._reassign_clusters_online(ki_f, CK, F_dim, H_dim, W_dim)
+        
+        # B. 质心更新
+        QC, _ = self._local_means(qi_f, c_LQ, device, dtype)
+        KC, KC_counts = self._local_means(ki_f, c_LK, device, dtype)
+        
+        # C. 簇级幅度修正
+        kc_ss = torch.zeros((B_slice, self.centers, 1), device=device, dtype=dtype)
+        kc_ss.scatter_add_(1, c_LK.unsqueeze(-1), si_k.unsqueeze(-1).to(dtype))
+        ks_c = (kc_ss / KC_counts.clamp(min=1))
+
+        n_g = si_q.size(1)
+        k_base, k_rem = self.centers // n_g, self.centers % n_g
+        k_repeats = torch.full((n_g,), k_base, device=device)
+        k_repeats[:k_rem] += 1
+        qs_c = torch.repeat_interleave(si_q.to(dtype), k_repeats, dim=1).unsqueeze(-1)
+        
+        # D. Tiered Attention
+        sc = torch.bmm((QC * qs_c), (KC * ks_c).transpose(1, 2)) * inv_sqrt_d
+        sc_idx = torch.sort(sc, dim=-1, descending=True)[1]
+        c0, c1, c2 = int(self.k0*self.centers), int(self.k1*self.centers), int(self.k2*self.centers)
+        
+        s = torch.full((qi.size(0), L, L), -10000.0, device=device, dtype=dtype)
+        q_s_f = self._expand_scale(si_q, F_dim, H_dim, W_dim)[:, :L].to(dtype)
+        k_s_f = si_k.to(dtype)
+
+        # Tier 1 (Exact)
+        m_e = torch.zeros_like(sc, dtype=torch.bool).scatter_(2, sc_idx[:, :, :int(self.k0*self.centers)], True)
+        m_e_exp = m_e.gather(1, c_LQ.unsqueeze(-1).expand(-1, -1, self.centers)).gather(2, c_LK.unsqueeze(1).expand(-1, L, -1))
+        del m_e 
+        res_e = torch.bmm(qi_f, ki_f.transpose(1, 2))
+        b, r, c = m_e_exp.nonzero(as_tuple=True)
+        s[b, r, c] = (res_e[b, r, c] * q_s_f[b, r] * k_s_f[b, c] * inv_sqrt_d).to(dtype)
+        del m_e_exp, res_e
+
+        # Tier 3 (Centroid)
+        m_c = torch.zeros_like(sc, dtype=torch.bool).scatter_(2, sc_idx[:, :, c0+c1:c0+c1+c2], True)
+        m_c_exp = m_c.gather(1, c_LQ.unsqueeze(-1).expand(-1, -1, self.centers)).gather(2, c_LK.unsqueeze(1).expand(-1, L, -1))
+        del m_c
+        b, r, c = m_c_exp.nonzero(as_tuple=True)
+        s[b, r, c] = sc[b, c_LQ[b, r], c_LK[b, c]].to(dtype)
+        del m_c_exp
+
+        # Tier 2 (Diff)
+        m_d = torch.zeros_like(sc, dtype=torch.bool).scatter_(2, sc_idx[:, :, c0:c0+c1], True)
+        m_d_exp = m_d.gather(1, c_LQ.unsqueeze(-1).expand(-1, -1, self.centers)).gather(2, c_LK.unsqueeze(1).expand(-1, L, -1))
+        del m_d
+        qc_t = torch.gather(QC, 1, c_LQ.unsqueeze(-1).expand(-1, -1, D_dim))
+        kc_t = torch.gather(KC, 1, c_LK.unsqueeze(-1).expand(-1, -1, D_dim))
+        q_diff, k_diff = (qi.to(dtype) - qc_t), (ki.to(dtype) - kc_t)
+        res_d = torch.bmm(QC, KC.transpose(1, 2)).gather(1, c_LQ.unsqueeze(-1).expand(-1,-1,self.centers)).gather(2, c_LK.unsqueeze(1).expand(-1,L,-1))
+        res_d.add_(torch.bmm(q_diff, KC.transpose(1, 2)).gather(2, c_LK.unsqueeze(1).expand(-1,L,-1)))
+        res_d.add_(torch.bmm(QC, k_diff.transpose(1, 2)).gather(1, c_LQ.unsqueeze(-1).expand(-1,-1,L)))
+        b, r, c = m_d_exp.nonzero(as_tuple=True)
+        s[b, r, c] = (res_d[b, r, c] * q_s_f[b, r] * k_s_f[b, c] * inv_sqrt_d).to(dtype)
+        del m_d_exp, res_d, qc_t, kc_t, q_diff, k_diff
+
+        res_out = torch.bmm(F.softmax(s, dim=-1), vi)
+        return res_out, QC.detach(), KC.detach()
 
     def _quantize_tokenwise(self, x, bits=8):
         B_all, L, D = x.shape
@@ -229,40 +235,52 @@ class SFCDC_Simulator:
         return l_global[:, :L]
 
 
-    def _run_offline_clustering(self, q, k, F_dim, H_dim, W_dim, prev_meta=None):
-        D, L = q.shape[-1], q.shape[0]
+    def _run_offline_clustering(self, q, k, F_dim, H_dim, W_dim, prev_meta=None, device=None):
+        L, D = q.shape[0], q.shape[1]
         dtype = q.dtype
         n_g = (F_dim + self.group_size - 1) // self.group_size
-        
-        # 分配质心数
         k_base, k_rem = self.centers // n_g, self.centers % n_g
         kpg_list = [k_base + 1 if i < k_rem else k_base for i in range(n_g)]
         
         def clus(data, p_all):
-            df = data.view(L, D)
             ls, cs, off = [], [], 0
             tpg = self.group_size * H_dim * W_dim
             for g_idx in range(n_g):
-                g = df[g_idx*tpg : min((g_idx+1)*tpg, L)]
+                g = data[g_idx*tpg : min((g_idx+1)*tpg, L)]
                 if g.size(0) == 0: continue
-                # 对应组的质心数
                 curr_k = kpg_list[g_idx]
-                ic = p_all[off : off + curr_k].to(dtype) if p_all is not None else None
-                _, l, c = self._kmeans_basic(g, curr_k, initial_centroids=ic)
-                ls.append(l + off); cs.append(c.to(dtype)); off += curr_k
+                ic = p_all[off : off + curr_k].to(device) if p_all is not None else None
+                _, l, c = self._kmeans_basic(g, curr_k, initial_centroids=ic, device=device)
+                ls.append(l + off); cs.append(c); off += curr_k
             return torch.cat(ls), torch.cat(cs)
             
-        lq, cq = clus(q, prev_meta["centroids_q"] if prev_meta else None)
-        lk, ck = clus(k, prev_meta["centroids_k"] if prev_meta else None)
+        p_q = prev_meta["centroids_q"] if prev_meta else None
+        p_k = prev_meta["centroids_k"] if prev_meta else None
+        lq, cq = clus(q, p_q)
+        lk, ck = clus(k, p_k)
         return {"labels_q": lq, "centroids_q": cq, "labels_k": lk, "centroids_k": ck}
 
-    def _kmeans_basic(self, x, k, n_iter=5, initial_centroids=None):
-        device, dtype, N, D = x.device, x.dtype, x.shape[0], x.shape[1]
-        c = initial_centroids.clone() if (initial_centroids is not None and initial_centroids.size(0) == k) else x[torch.randperm(N, device=device)[:k]]
-        c = c.to(dtype)
+    def _kmeans_basic(self, x, k, n_iter=5, initial_centroids=None, device=None):
+        dtype, N, D = x.dtype, x.shape[0], x.shape[1]
+        if initial_centroids is not None and initial_centroids.size(0) == k:
+            c = initial_centroids.clone().to(dtype)
+        else:
+            c = x[torch.randperm(N, device=device)[:k]].to(dtype)
+        
         for _ in range(n_iter):
-            l = torch.argmin(torch.cdist(x, c, p=2)**2, dim=1)
-            nc, cnt = torch.zeros_like(c), torch.zeros(k, 1, device=device, dtype=dtype)
-            nc.index_add_(0, l, x); cnt.index_add_(0, l, torch.ones(N, 1, device=device, dtype=dtype))
+            # 严格在传入的 device 上计算
+            dist = torch.cdist(x, c, p=2)**2
+            l = torch.argmin(dist, dim=1)
+            nc = torch.zeros_like(c)
+            cnt = torch.zeros((k, 1), device=device, dtype=dtype)
+            nc.index_add_(0, l, x)
+            cnt.index_add_(0, l, torch.ones((N, 1), device=device, dtype=dtype))
             c = nc / (cnt + 1e-6)
         return None, l, c.to(dtype)
+
+    def _local_means(self, data, labels, device, dtype):
+        m = torch.zeros((data.size(0), self.centers, data.size(2)), device=device, dtype=dtype)
+        c = torch.zeros((data.size(0), self.centers, 1), device=device, dtype=dtype)
+        m.scatter_add_(1, labels.unsqueeze(-1).expand(-1,-1,data.size(2)), data)
+        c.scatter_add_(1, labels.unsqueeze(-1), torch.ones_like(labels).unsqueeze(-1).to(dtype))
+        return (m / c.clamp(min=1)).round(), c
