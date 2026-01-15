@@ -7,11 +7,11 @@ import glob
 import cv2
 import numpy as np
 import tensorflow.compat.v1 as tf
-from frechet_video_distance import frechet_video_distance as fvd
+import frechet_video_distance as fvd
 
 # Number of videos must be divisible by 16 (or按你的 FVD 实现要求调整)
-NUMBER_OF_VIDEOS = 16
-VIDEO_LENGTH = 81
+NUMBER_OF_VIDEOS = 8
+VIDEO_LENGTH = 53
 
 def load_videos_from_paths(paths, video_length):
   """Load list of video files -> numpy array [N, T, H, W, 3], dtype=uint8.
@@ -58,8 +58,8 @@ def get_file_list(folder, ext_list=("mp4","avi","mov","mkv")):
 def main(argv):
   del argv
   # 指定两个目录或两个文件列表
-  folder_a = "./examples"
-  folder_b = "./examples"
+  folder_a = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/dense"
+  folder_b = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/sfcdc"
 
   files_a = get_file_list(folder_a)[:NUMBER_OF_VIDEOS]
   files_b = get_file_list(folder_b)[:NUMBER_OF_VIDEOS]
