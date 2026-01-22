@@ -1,12 +1,12 @@
-# SFCDC version: 2.1
-# 多GPU协作，优化计算
+# SFCDC version: 2.2
+# 多GPU协作，优化计算，增加Linf
 import torch
 import torch.nn.functional as F
 import math
 import threading
 
 class SFCDC_Simulator:
-    def __init__(self, enabled=False, start_iter=2, end_iter=45, centers=256, group_size=4, k0=0.02, k1=0.08, k2=0.15, l_f=16, l_h=16, l_w=16, dual_diff=False):
+    def __init__(self, enabled=False, start_iter=2, end_iter=45, centers=256, group_size=4, k0=0.02, k1=0.08, k2=0.15, l_f=16, l_h=16, l_w=16, dual_diff=False, q_quant_type='block', k_quant_type='token', dist_metric='L1'):
         self.enabled = enabled
         self.start_iter = start_iter
         self.end_iter = end_iter
@@ -16,6 +16,9 @@ class SFCDC_Simulator:
         self.k1 = k1
         self.k2 = k2
         self.dual_diff = dual_diff  # [new] 控制是否开启双端(Query + Key)差分补偿
+        self.q_quant_type = q_quant_type
+        self.k_quant_type = k_quant_type
+        self.dist_metric = dist_metric
         
         self.l_f = l_f                
         self.l_h = l_h                
@@ -38,8 +41,16 @@ class SFCDC_Simulator:
         curr_L = q_all.size(1)
 
         # 1. 显存优化：使用 int8 存储量化数据
-        q_int_raw, q_s_inv = self._quantize_batch_blockwise(q_all, F_dim, H_dim, W_dim)
-        k_int_raw, k_s_inv = self._quantize_tokenwise(k_all)
+        if self.q_quant_type == 'block':
+            q_int_raw, q_s_inv = self._quantize_batch_blockwise(q_all, F_dim, H_dim, W_dim)
+        else:
+            q_int_raw, q_s_inv = self._quantize_tokenwise(q_all)
+            
+        if self.k_quant_type == 'block':
+            k_int_raw, k_s_inv = self._quantize_batch_blockwise(k_all, F_dim, H_dim, W_dim)
+        else:
+            k_int_raw, k_s_inv = self._quantize_tokenwise(k_all)
+            
         q_int, k_int = q_int_raw.to(torch.int8), k_int_raw.to(torch.int8)
 
         num_gpus = torch.cuda.device_count()
@@ -51,15 +62,25 @@ class SFCDC_Simulator:
                 gpu_splits.append((start, end, torch.device(f"cuda:{i}")))
 
         if iter_idx < self.start_iter:
-            sq_all = self._expand_scale(q_s_inv, F_dim, H_dim, W_dim)[:, :curr_L].unsqueeze(-1)
-            sk_all = k_s_inv.unsqueeze(-1)
+            if self.q_quant_type == 'block':
+                sq_all = self._expand_scale(q_s_inv, F_dim, H_dim, W_dim)[:, :curr_L].unsqueeze(-1)
+            else:
+                sq_all = q_s_inv.unsqueeze(-1)
+
+            if self.k_quant_type == 'block':
+                sk_all = self._expand_scale(k_s_inv, F_dim, H_dim, W_dim)[:, :curr_L].unsqueeze(-1)
+            else:
+                sk_all = k_s_inv.unsqueeze(-1)
             
             def train_worker(start, end, target_dev):
                 for i in range(start, end):
                     meta_key = (key, layer_idx, i % N)
                     qi = (q_int[i].to(target_dev, dtype=dtype) * sq_all[i].to(target_dev))
                     ki = (k_int[i].to(target_dev, dtype=dtype) * sk_all[i].to(target_dev))
-                    res = self._run_offline_clustering(qi, ki, F_dim, H_dim, W_dim, device=target_dev)
+                    
+                    prev_res = self.offline_meta.get(meta_key, None)
+                    
+                    res = self._run_offline_clustering(qi, ki, F_dim, H_dim, W_dim, prev_meta=prev_res, device=target_dev)
                     res["centroids_q"] = res["centroids_q"].to("cpu")
                     res["centroids_k"] = res["centroids_k"].to("cpu")
                     self.offline_meta[meta_key] = res
@@ -115,8 +136,18 @@ class SFCDC_Simulator:
         QC, _ = self._local_means(qi_f, c_LQ, device, dtype)
         KC, KC_counts = self._local_means(ki_f, c_LK, device, dtype)
         
+        if si_q.size(1) < L:
+             q_s_f = self._expand_scale(si_q, F_dim, H_dim, W_dim)[:, :L].to(dtype)
+        else:
+             q_s_f = si_q.to(dtype)
+
+        if si_k.size(1) < L:
+             k_s_f = self._expand_scale(si_k, F_dim, H_dim, W_dim)[:, :L].to(dtype)
+        else:
+             k_s_f = si_k.to(dtype)
+
         kc_ss = torch.zeros((B_slice, self.centers, 1), device=device, dtype=dtype)
-        kc_ss.scatter_add_(1, c_LK.unsqueeze(-1), si_k.unsqueeze(-1).to(dtype))
+        kc_ss.scatter_add_(1, c_LK.unsqueeze(-1), k_s_f.unsqueeze(-1))
         ks_c = (kc_ss / KC_counts.clamp(min=1))
 
         n_g = si_q.size(1)
@@ -131,8 +162,6 @@ class SFCDC_Simulator:
         c0, c1, c2 = int(self.k0*self.centers), int(self.k1*self.centers), int(self.k2*self.centers)
         
         s = torch.full((B_slice, L, L), -10000.0, device=device, dtype=dtype)
-        q_s_f = self._expand_scale(si_q, F_dim, H_dim, W_dim)[:, :L].to(dtype)
-        k_s_f = si_k.to(dtype)
 
         # Tier 1 (Exact)
         m_e = torch.zeros_like(sc, dtype=torch.bool).scatter_(2, sc_idx[:, :, :c0], True)
@@ -226,7 +255,8 @@ class SFCDC_Simulator:
         
         # [优化点] 合并 batch 和 group 维度，使用 batch cdist 避免生成巨大的 5D 张量
         T_per_g = x_g.size(2)
-        dist = torch.cdist(x_g.view(-1, T_per_g, D), c_g.view(-1, max_k, D), p=1)
+        p_norm = 1.0 if self.dist_metric == 'L1' else float('inf')
+        dist = torch.cdist(x_g.view(-1, T_per_g, D), c_g.view(-1, max_k, D), p=p_norm)
         l = torch.argmin(dist.view(B_all, n_g, T_per_g, max_k), dim=-1)
         
         offsets = torch.zeros(n_g, device=device, dtype=torch.long)
@@ -269,11 +299,30 @@ class SFCDC_Simulator:
         if initial_centroids is not None and initial_centroids.size(0) == k:
             c = initial_centroids.clone().to(dtype)
         else:
-            c = x[torch.randperm(N, device=device)[:k]].to(dtype)
+            # [K-Means++] Initialization
+            c = torch.empty((k, D), device=device, dtype=dtype)
+            curr_idx = torch.randint(N, (1,), device=device).item()
+            c[0] = x[curr_idx]
+            
+            p_norm = 1.0 if self.dist_metric == 'L1' else float('inf')
+            # Initialize min distance (squared) to the first center
+            dist_sq = torch.cdist(x, c[0:1], p=p_norm).squeeze(1) ** 2
+            
+            for i in range(1, k):
+                if dist_sq.sum() > 1e-6:
+                    curr_idx = torch.multinomial(dist_sq, 1).item()
+                else:
+                    curr_idx = torch.randint(N, (1,), device=device).item()
+                
+                c[i] = x[curr_idx]
+                # Update min distance
+                new_dist_sq = torch.cdist(x, c[i:i+1], p=p_norm).squeeze(1) ** 2
+                dist_sq = torch.minimum(dist_sq, new_dist_sq)
+            c = c.to(dtype)
         
         for _ in range(n_iter):
-            # 严格在传入的 device 上计算
-            dist = torch.cdist(x, c, p=2)**2
+            p_norm = 1.0 if self.dist_metric == 'L1' else float('inf')
+            dist = torch.cdist(x, c, p=p_norm)
             l = torch.argmin(dist, dim=1)
             nc = torch.zeros_like(c)
             cnt = torch.zeros((k, 1), device=device, dtype=dtype)
