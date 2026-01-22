@@ -28,19 +28,28 @@ def main():
     # --- 配置路径 ---
     folder_real = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/dense"
     folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/sfcdc"
+    # folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/SVG2"
+    # folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/sfcdc_N512G5QBKB_2"
     
     # 获取文件列表
-    files_real = sorted(glob.glob(os.path.join(folder_real, "*.mp4")))
-    files_gen = sorted(glob.glob(os.path.join(folder_gen, "*.mp4")))
+    files_real_map = {os.path.basename(f): f for f in glob.glob(os.path.join(folder_real, "*.mp4"))}
+    files_gen_map = {os.path.basename(f): f for f in glob.glob(os.path.join(folder_gen, "*.mp4"))}
     
-    num_videos = min(len(files_real), len(files_gen))
-    print(f"Compute PSNR with {num_videos} pairs of videos...")
+    # 取交集：只计算两边都有的文件名
+    common_names = sorted(list(set(files_real_map.keys()) & set(files_gen_map.keys())))
+    num_videos = len(common_names)
+    
+    if num_videos == 0:
+        print("No matching video pairs found based on filenames!")
+        return
+
+    print(f"Compute PSNR with {num_videos} pairs of matched videos...")
 
     all_video_psnrs = []
 
-    for i in range(num_videos):
-        vid_real = load_video(files_real[i])
-        vid_gen = load_video(files_gen[i])
+    for i, name in enumerate(common_names):
+        vid_real = load_video(files_real_map[name])
+        vid_gen = load_video(files_gen_map[name])
         
         # 确保帧数对齐
         T = min(len(vid_real), len(vid_gen))
@@ -52,7 +61,7 @@ def main():
         
         avg_v_psnr = np.mean(frame_psnrs)
         all_video_psnrs.append(avg_v_psnr)
-        print(f"Video {i+1}/{num_videos} [{os.path.basename(files_gen[i])}]: PSNR = {avg_v_psnr:.2f} dB")
+        print(f"Video {i+1}/{num_videos} [{name}]: PSNR = {avg_v_psnr:.2f} dB")
 
     overall_psnr = np.mean(all_video_psnrs)
     print("\n" + "="*40)

@@ -34,24 +34,33 @@ def main():
     # --- 配置路径 ---
     folder_real = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/dense"
     folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/sfcdc"
+    # folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/SVG2"
+    # folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/
     
     # 1. 初始化 LPIPS 模型 (net='alex' 速度最快且最常用，'vgg' 更精准但更慢)
     loss_fn = lpips.LPIPS(net='alex').to(DEVICE)
     loss_fn.eval()
     
     # 获取文件列表
-    files_real = sorted(glob.glob(os.path.join(folder_real, "*.mp4")))
-    files_gen = sorted(glob.glob(os.path.join(folder_gen, "*.mp4")))
+    files_real_map = {os.path.basename(f): f for f in glob.glob(os.path.join(folder_real, "*.mp4"))}
+    files_gen_map = {os.path.basename(f): f for f in glob.glob(os.path.join(folder_gen, "*.mp4"))}
     
-    num_videos = min(len(files_real), len(files_gen))
-    print(f"Compute LPIPS (AlexNet) with {num_videos} pairs of videos on {DEVICE}...")
+    # 取交集
+    common_names = sorted(list(set(files_real_map.keys()) & set(files_gen_map.keys())))
+    num_videos = len(common_names)
+    
+    if num_videos == 0:
+        print("No matching video pairs found based on filenames!")
+        return
+
+    print(f"Compute LPIPS (AlexNet) with {num_videos} pairs of matched videos on {DEVICE}...")
 
     all_video_lpips = []
 
     with torch.no_grad():
-        for i in range(num_videos):
-            vid_real = load_video(files_real[i])
-            vid_gen = load_video(files_gen[i])
+        for i, name in enumerate(common_names):
+            vid_real = load_video(files_real_map[name])
+            vid_gen = load_video(files_gen_map[name])
             
             # 确保帧数对齐
             T = min(len(vid_real), len(vid_gen))
@@ -68,7 +77,7 @@ def main():
             
             avg_v_lpips = np.mean(frame_lpips)
             all_video_lpips.append(avg_v_lpips)
-            print(f"Video {i+1}/{num_videos} [{os.path.basename(files_gen[i])}]: LPIPS = {avg_v_lpips:.4f}")
+            print(f"Video {i+1}/{num_videos} [{name}]: LPIPS = {avg_v_lpips:.4f}")
 
     overall_lpips = np.mean(all_video_lpips)
     print("\n" + "="*40)

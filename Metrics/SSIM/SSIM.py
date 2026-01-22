@@ -26,19 +26,28 @@ def main():
     # --- 配置路径 ---
     folder_real = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/dense"
     folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/sfcdc"
+    # folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/SVG2"
+    # folder_gen = "/login_home/shuchang/Desktop/Wan2.2/tests/videos/F53/
     
     # 获取文件列表
-    files_real = sorted(glob.glob(os.path.join(folder_real, "*.mp4")))
-    files_gen = sorted(glob.glob(os.path.join(folder_gen, "*.mp4")))
+    files_real_map = {os.path.basename(f): f for f in glob.glob(os.path.join(folder_real, "*.mp4"))}
+    files_gen_map = {os.path.basename(f): f for f in glob.glob(os.path.join(folder_gen, "*.mp4"))}
     
-    num_videos = min(len(files_real), len(files_gen))
-    print(f"Compute SSIM with {num_videos} pairs of videos...")
+    # 取交集
+    common_names = sorted(list(set(files_real_map.keys()) & set(files_gen_map.keys())))
+    num_videos = len(common_names)
+    
+    if num_videos == 0:
+        print("No matching video pairs found based on filenames!")
+        return
+
+    print(f"Compute SSIM with {num_videos} pairs of matched videos...")
 
     all_video_ssims = []
 
-    for i in range(num_videos):
-        vid_real = load_video(files_real[i])
-        vid_gen = load_video(files_gen[i])
+    for i, name in enumerate(common_names):
+        vid_real = load_video(files_real_map[name])
+        vid_gen = load_video(files_gen_map[name])
         
         # 确保帧数对齐
         T = min(len(vid_real), len(vid_gen))
@@ -51,7 +60,7 @@ def main():
         
         avg_v_ssim = np.mean(frame_ssims)
         all_video_ssims.append(avg_v_ssim)
-        print(f"Video {i+1}/{num_videos} [{os.path.basename(files_gen[i])}]: SSIM = {avg_v_ssim:.4f}")
+        print(f"Video {i+1}/{num_videos} [{name}]: SSIM = {avg_v_ssim:.4f}")
 
     overall_ssim = np.mean(all_video_ssims)
     print("\n" + "="*40)
