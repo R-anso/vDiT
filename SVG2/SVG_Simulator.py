@@ -20,7 +20,6 @@ class SVG_Simulator:
         self.centroids_cache = {} 
         
         # 缓存当前 Iteration 范围内的状态 (Interval Clustering)
-        # key: "{cond_key}_{layer_idx}" -> value: { 'q_labels': ..., 'map': ... }
         self.state_cache = {}
 
     def run(self, q, k, v, layer_idx, iter_idx, grid_sizes, key="default"):
@@ -50,9 +49,6 @@ class SVG_Simulator:
         
         # 如果需要更新，或者没有缓存，则执行聚类
         if should_update or cached_state is None:
-            # -------------------------------------------------
-            # 执行聚类与计算 Mask (Heavy Path)
-            # -------------------------------------------------
             
             # [B, H, L, D] -> [B*H, L, D]
             q_flat = q_curr.flatten(0, 1)
@@ -83,9 +79,6 @@ class SVG_Simulator:
             }
             self.state_cache[state_key] = cached_state
         
-        # -------------------------------------------------
-        # 使用当前/缓存的状态执行 Attention
-        # -------------------------------------------------
         q_labels = cached_state['q_labels']
         k_labels = cached_state['k_labels']
         connectivity_map = cached_state['map']
@@ -97,8 +90,6 @@ class SVG_Simulator:
             return torch.where(is_connected, 0, float("-inf")) + score
 
         try:
-            # 注意: 缓存 Block Mask 本身比较复杂，因为 L 可能变化(虽然通常不变)
-            # 但 create_block_mask 带有 _compile=True 已经涵盖了大部分优化
             block_mask = create_block_mask(
                 sap_score_mod, 
                 B, H, L, L, 
