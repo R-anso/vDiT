@@ -355,24 +355,20 @@ class SFCDC_Simulator:
             c = initial_centroids.clone().to(dtype)
         else:
             # [K-Means++] Initialization (using p_norm distance)
-            # 消除随机性：使用固定种子初始化聚类
-            with torch.random.fork_rng(devices=[device] if device.type == 'cuda' else None):
-                torch.manual_seed(42)
-
-                c = torch.empty((k, D), device=device, dtype=dtype)
-                curr_idx = torch.randint(N, (1,), device=device).item()
-                c[0] = x[curr_idx]
-                dist_sq = torch.cdist(x, c[0:1], p=p_norm).squeeze(1) ** 2
-                
-                for i in range(1, k):
-                    if dist_sq.sum() > 1e-6:
-                        curr_idx = torch.multinomial(dist_sq.clamp(min=0), 1).item()
-                    else:
-                        curr_idx = torch.randint(N, (1,), device=device).item()
-                    c[i] = x[curr_idx]
-                    new_dist_sq = torch.cdist(x, c[i:i+1], p=p_norm).squeeze(1) ** 2
-                    dist_sq = torch.minimum(dist_sq, new_dist_sq)
-                c = c.to(dtype)
+            c = torch.empty((k, D), device=device, dtype=dtype)
+            curr_idx = torch.randint(N, (1,), device=device).item()
+            c[0] = x[curr_idx]
+            dist_sq = torch.cdist(x, c[0:1], p=p_norm).squeeze(1) ** 2
+            
+            for i in range(1, k):
+                if dist_sq.sum() > 1e-6:
+                    curr_idx = torch.multinomial(dist_sq.clamp(min=0), 1).item()
+                else:
+                    curr_idx = torch.randint(N, (1,), device=device).item()
+                c[i] = x[curr_idx]
+                new_dist_sq = torch.cdist(x, c[i:i+1], p=p_norm).squeeze(1) ** 2
+                dist_sq = torch.minimum(dist_sq, new_dist_sq)
+            c = c.to(dtype)
         
         for _ in range(n_iter):
             # 1. 距离计算 (Assignment) -> 使用 dist_metric
