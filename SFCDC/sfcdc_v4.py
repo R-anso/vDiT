@@ -8,23 +8,40 @@ import math
 from typing import Optional, Dict, Tuple
 from svg.ops.sfcdc_triton import sfcdc_attention_v4_2
 
-def compiled_cdist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def compiled_cdist(x: torch.Tensor, y: torch.Tensor, max_batch: int = 16) -> torch.Tensor:
     """
     Compute Euclidean distance matrix between x and y.
     x: [B, N, D]
     y: [B, M, D]
     Returns: [B, N, M]
+    Sub-batches along B dimension to limit peak GPU memory.
     """
-    # Use float32 for stability in distance calculation if input is fp16/bf16
     dtype_orig = x.dtype
-    if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
-        x = x.float()
-        y = y.float()
+    B = x.shape[0]
 
-    x_norm = (x**2).sum(-1, keepdim=True) # [B, N, 1]
-    y_norm = (y**2).sum(-1, keepdim=True) # [B, M, 1]
-    dist = x_norm + y_norm.transpose(-2, -1) - 2.0 * (x @ y.transpose(-2, -1))
-    return dist.clamp(min=0.0).to(dtype_orig)
+    if B <= max_batch:
+        # Small batch: original logic, no sub-batching needed
+        if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
+            x = x.float()
+            y = y.float()
+        x_norm = (x**2).sum(-1, keepdim=True)  # [B, N, 1]
+        y_norm = (y**2).sum(-1, keepdim=True)  # [B, M, 1]
+        dist = x_norm + y_norm.transpose(-2, -1) - 2.0 * (x @ y.transpose(-2, -1))
+        return dist.clamp(min=0.0).to(dtype_orig)
+
+    # Sub-batch processing to avoid OOM on large B
+    N, M = x.shape[1], y.shape[1]
+    result = torch.empty(B, N, M, device=x.device, dtype=dtype_orig)
+    for i in range(0, B, max_batch):
+        j = min(i + max_batch, B)
+        xi = x[i:j].float() if x.dtype in (torch.float16, torch.bfloat16) else x[i:j]
+        yi = y[i:j].float() if y.dtype in (torch.float16, torch.bfloat16) else y[i:j]
+        x_norm = (xi**2).sum(-1, keepdim=True)
+        y_norm = (yi**2).sum(-1, keepdim=True)
+        dist = x_norm + y_norm.transpose(-2, -1) - 2.0 * (xi @ yi.transpose(-2, -1))
+        result[i:j] = dist.clamp(min=0.0).to(dtype_orig)
+        del xi, yi, x_norm, y_norm, dist
+    return result
 
 def batched_kmeans(x: torch.Tensor, num_clusters: int, num_iters: int = 5, init_centroids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -145,7 +162,7 @@ class SFCDC_Simulator:
 
         # --- Phase 1: Clustering (Train / Warmup) ---
         if iter_idx < self.start_iter:
-            chunk_size = 32
+            chunk_size = 16 
             
             for start_b in range(0, B_all, chunk_size):
                 end_b = min(start_b + chunk_size, B_all)
@@ -180,8 +197,8 @@ class SFCDC_Simulator:
                     pass
 
                 # Run KMeans (Unscaled centroids return)
-                _, centroids_q, _ = batched_kmeans(qi_chunk, self.centers_q, init_centroids=cq_init)
-                _, centroids_k, _ = batched_kmeans(ki_chunk, self.centers_k, init_centroids=ck_init)
+                _, centroids_q, _ = batched_kmeans(qi_chunk, self.centers_q, init_centroids=cq_init, num_iters=1)
+                _, centroids_k, _ = batched_kmeans(ki_chunk, self.centers_k, init_centroids=ck_init, num_iters=1)
                 
                 for i in range(start_b, end_b):
                     meta_key = (key, layer_idx, i % N)
@@ -195,7 +212,8 @@ class SFCDC_Simulator:
         # --- Phase 2: Inference (Acceleration) ---
         out_all = torch.empty_like(q_all)
         inv_sqrt_d = 1.0 / math.sqrt(D)
-        chunk_size = 32 # Optimized for A6000/4090
+        # [Memory] Smaller chunk to limit peak memory in _reassign_clusters_online
+        chunk_size = 8
         
         for start_b in range(0, B_all, chunk_size):
             end_b = min(start_b + chunk_size, B_all)
@@ -263,7 +281,6 @@ class SFCDC_Simulator:
         # --- NEW V4.3 LOGIC: Centroid Scaling ---
         # "Clustering center calculation S_c metrix needs consider quan factor"
         # We need "Real" Centroids for the Tier Table calculation to be accurate relative to real attention scores.
-        # Compute Average Scale per Cluster
         # qc_scales: [B, Nc, 1]
         
         # Treat scales as a rank-3 tensor [B, L, 1] to reuse calculate_centroids
@@ -310,9 +327,12 @@ class SFCDC_Simulator:
         lq_sorted = c_LQ[B_arange, idx_q_sorted]
         lk_sorted = c_LK[B_arange, idx_k_sorted]
         
+        # Free large intermediate tensors no longer needed
+        del q_real, k_real, qi_f, ki_f
+        
         # Compute V_sums per Cluster (O=PV Optimization)
-        # Flat indices for index_add_
-        v_flat = v_sorted.flatten(0, 1) # [B*L, D]
+        # Use original-order vi and c_LK (both unsorted) for consistent pairing
+        v_flat = vi.flatten(0, 1) # [B*L, D]
         # Global cluster IDs: batch_idx * num_clusters + cluster_idx
         lk_flat = (c_LK + (torch.arange(B_slice, device=device)*self.centers_k).unsqueeze(1)).flatten()
         v_sums_flat = torch.zeros(B_slice * self.centers_k, vi.shape[-1], device=device, dtype=dtype)
@@ -326,6 +346,16 @@ class SFCDC_Simulator:
         k_starts = torch.cat([torch.zeros(B_slice, 1, device=device, dtype=torch.int32), k_offsets[:, :-1]], dim=1)
         k_ends = k_offsets
         
+        # Pad Q/K/V/LQ to BLOCK_M=64 alignment
+        BLOCK_M = 64
+        L_actual = q_sorted.size(1)
+        pad_len = (BLOCK_M - L_actual % BLOCK_M) % BLOCK_M
+        if pad_len > 0:
+            q_sorted = F.pad(q_sorted, (0, 0, 0, pad_len))
+            k_sorted = F.pad(k_sorted, (0, 0, 0, pad_len))
+            v_sorted = F.pad(v_sorted, (0, 0, 0, pad_len))
+            lq_sorted = F.pad(lq_sorted, (0, pad_len), value=0)
+
         # Prepare Kernel Inputs
         q_in = q_sorted.unsqueeze(1).contiguous()
         k_in = k_sorted.unsqueeze(1).contiguous()
@@ -353,7 +383,7 @@ class SFCDC_Simulator:
             tier_table_in,
             sm_scale=inv_sqrt_d
         )
-        out_sorted = out_sorted.squeeze(1)
+        out_sorted = out_sorted.squeeze(1)[:, :L_actual]  # Remove padding
         out = out_sorted[B_arange, idx_q_restore]
         
         return out, QC.detach(), KC.detach()
@@ -445,6 +475,9 @@ class SFCDC_Simulator:
         # Convert local centroid index to global index
         l_offset = torch.tensor([0] + k_repeats[:-1], device=device).cumsum(0).view(1, n_g, 1)
         l_global = (l_local + l_offset).view(B_all, -1)[:, :L]
+        
+        # Safety clamp: prevent out-of-bounds when padded centroids are selected
+        l_global = l_global.clamp(0, num_centroids - 1)
         
         return l_global
 
