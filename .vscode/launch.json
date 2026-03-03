@@ -1,0 +1,183 @@
+
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "hyvideo (T2V-13B) all video",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SFCDC/hyvideo_t2v_inference.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--model-base", "./HunyuanVideo/ckpts",
+                "--dit-weight", "./HunyuanVideo/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt",
+                "--prompt_path", "./tests/Wan2.1/prompts",
+                "--all_id",
+                "--all_video_path", "./tests/HunyuanVideo/videos/F129/sfcdc_v5",
+                // "--overlap",
+                "--video-length", "129",
+                "--seed", "42",
+                "--seed-type", "fixed",
+                "--use-cpu-offload",
+                "--model-resolution", "720p",
+            ]
+        },
+        {
+            "name": "CogvideoX1.5 (I2V/T2V-5B) all video",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SFCDC/cog_inference.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--prompt_path", "./tests/CogVideoX1.5/prompts",
+                "--all_id",
+                "--all_video_path", "./tests/CogVideoX1.5/videos/F81/sfcdc_v5_param2",
+                "--use_dynamic_cfg",
+                "--overlap", "False",
+                "--num_frames", "81",
+                "--dtype", "bfloat16",
+                "--seed", "42",
+            ]
+        },
+        {
+            "name": "CogvideoX1.5 (I2V-5B) Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SFCDC/cog_i2v_inference.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--model_path", "./CogVideoX1.5/model/CogVideoX1.5-5B-I2V",
+                "--prompt_path", "./tests/CogVideoX1.5/prompts",
+                "--prompt_id", "16",
+                "--output_path", "./tests/CogVideoX1.5/videos/F81/dense/16.mp4",
+                "--use_dynamic_cfg",
+                "--num_frames", "81",
+                "--dtype", "bfloat16",
+                "--seed", "42",
+            ]
+        },
+        {
+            "name": "CogvideoX1.5 (T2V-5B) Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SFCDC/cog_t2v_inference.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--model_path", "./CogVideoX1.5/model/CogVideoX1.5-5B",
+                "--prompt_path", "./tests/CogVideoX1.5/prompts",
+                "--prompt_id", "1",
+                "--output_path", "./tests/CogVideoX1.5/videos/F81/sfcdc_v5_param3/1.mp4",
+                "--use_dynamic_cfg",
+                "--num_frames", "81",
+                "--dtype", "bfloat16",
+                "--seed", "42",
+            ]
+        },
+        {
+            "name": "SFCDC Wan2.1 all video",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SFCDC/wan2.1_inference.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--size", "1280*720",
+                "--prompt_path", "./tests/Wan2.1/prompts",
+                "--all_id",
+                "--all_video_path", "./tests/Wan2.1/videos/F81/dense",
+                // "--overlap",
+                "--offload_model", "True",
+                "--t5_cpu",
+                "--base_seed", "42",
+                "--frame_num", "81",
+            ]
+        },
+        {
+            "name": "SFCDC Wan2.1 (T2V-14B) Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SFCDC/wan2.1_inference.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--task", "t2v-14B",
+                "--ckpt_dir", "./Wan2.1/model/Wan2.1-T2V-14B",
+                "--size", "1280*720", //"832*480",
+                "--prompt_path", "./tests/Wan2.2/prompts",
+                "--prompt_id", "7",
+                "--save_file", "./tests/Wan2.1/videos/F81/sfcdc_v4/7.mp4",
+                "--offload_model", "True",
+                "--t5_cpu",
+                "--base_seed", "42",
+                "--frame_num", "81",
+            ]
+        },
+        {
+            "name": "SFCDC Wan2.2 (ti2v-5B) Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SFCDC/wan2.2_inference.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--task", "ti2v-5B",
+                "--ckpt_dir", "./Wan2.2/model",
+                "--size", "1280*704",
+                "--frame_num", "53",
+                "--sample_steps", "50",
+                "--convert_model_dtype",
+                "--prompt_path", "./tests/Wan2.2/prompts",
+                "--prompt_id", "8",
+                "--offload_model", "False",
+                "--t5_cpu",
+                "--base_seed", "42",
+                "--save_file", "./Wan2.2/tests/videos/F53/sfcdc_v4/8.mp4"
+            ]
+        },
+        {
+            "name": "Generate with 1 GPU (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./Wan2.2/generate.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,1"
+            },
+            "args": [
+                "--task", "ti2v-5B",
+                "--ckpt_dir", "./model",
+                "--size", "1280*704",
+                "--frame_num", "53",    // 29, 53
+                "--sample_steps", "50",
+                "--convert_model_dtype",
+                "--prompt_path", "./Wan2.2/tests/prompts",
+                "--prompt_id", "8",
+                "--offload_model", "False",
+                "--t5_cpu",
+                "--base_seed", "42",
+                // "--save_file", "./tests/videos/F53/sfcdc_Q384BK384BG5_L1_Mean/1.mp4",
+                "--save_file", "./tests/videos/F53/sfcdc_Q384BK384BG5_L2_Mean/8_test.mp4",
+                // "--save_file", "./tests/videos/F53/SVG2_Q384K384P90/1.mp4",
+                // "--save_file", "./tests/videos/F53/sfcdc2/8_k0.125_k1.25_k2.25_GS5_Nc512.mp4",
+            ]
+        }
+    ]
+}

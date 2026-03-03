@@ -1,4 +1,4 @@
-# SFCDC version: 4.3 (Production Ready & Optimized)
+# SFCDC version: 4.4 (Optimized for low-VRAM usage)
 # Implements SVG2-style reordering for contiguous memory access
 # Optimizes Tier 2/3 by using pre-aggregated V sums (O=PV optimization)
 
@@ -8,9 +8,9 @@ import math
 from typing import Optional, Dict, Tuple
 from svg.ops.sfcdc_triton import sfcdc_attention_v4_2
 
-def compiled_cdist(x: torch.Tensor, y: torch.Tensor, max_batch: int = 20) -> torch.Tensor:
+def compiled_cdist(x: torch.Tensor, y: torch.Tensor, max_batch: int = 16) -> torch.Tensor:
     """
-    Compute Squared Euclidean distance matrix between x and y using efficient torch.cdist.
+    Compute Euclidean distance matrix between x and y.
     x: [B, N, D]
     y: [B, M, D]
     Returns: [B, N, M]
@@ -19,34 +19,65 @@ def compiled_cdist(x: torch.Tensor, y: torch.Tensor, max_batch: int = 20) -> tor
     dtype_orig = x.dtype
     B = x.shape[0]
 
-    # Optimized implementation using torch.cdist for memory efficiency
-    # Note: torch.cdist computes Euc distance, so we square it to match original behavior
-    
     if B <= max_batch:
-        xi = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
-        yi = y.float() if y.dtype in (torch.float16, torch.bfloat16) else y
-        
-        # p=2 is Euclidean distance. We want Squared Euclidean
-        return torch.cdist(xi, yi, p=2.0).pow(2).to(dtype_orig)
+        # Small batch: original logic, no sub-batching needed
+        if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
+            x = x.float()
+            y = y.float()
+        x_norm = (x**2).sum(-1, keepdim=True)  # [B, N, 1]
+        y_norm = (y**2).sum(-1, keepdim=True)  # [B, M, 1]
+        dist = x_norm + y_norm.transpose(-2, -1) - 2.0 * (x @ y.transpose(-2, -1))
+        return dist.clamp(min=0.0).to(dtype_orig)
 
     # Sub-batch processing to avoid OOM on large B
     N, M = x.shape[1], y.shape[1]
     result = torch.empty(B, N, M, device=x.device, dtype=dtype_orig)
-    
     for i in range(0, B, max_batch):
         j = min(i + max_batch, B)
-        # Slicing views are free
-        xi = x[i:j]
-        yi = y[i:j]
-        
-        if xi.dtype in (torch.float16, torch.bfloat16):
-             dist = torch.cdist(xi.float(), yi.float(), p=2.0).pow(2)
-        else:
-             dist = torch.cdist(xi, yi, p=2.0).pow(2)
-             
-        result[i:j] = dist.to(dtype_orig)
-        
+        xi = x[i:j].float() if x.dtype in (torch.float16, torch.bfloat16) else x[i:j]
+        yi = y[i:j].float() if y.dtype in (torch.float16, torch.bfloat16) else y[i:j]
+        x_norm = (xi**2).sum(-1, keepdim=True)
+        y_norm = (yi**2).sum(-1, keepdim=True)
+        dist = x_norm + y_norm.transpose(-2, -1) - 2.0 * (xi @ yi.transpose(-2, -1))
+        result[i:j] = dist.clamp(min=0.0).to(dtype_orig)
+        del xi, yi, x_norm, y_norm, dist
     return result
+
+def chunked_argmin_cdist(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    max_batch: int = 16,
+    chunk_m: int = 64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Memory-efficient nearest-centroid search.
+    Computes argmin_j ||x - y_j||^2 without materializing full [B, N, M] distance tensor.
+
+    x: [B, N, D]
+    y: [B, M, D]
+    returns:
+      min_idx:  [B, N] (int64)
+      min_dist: [B, N] (same dtype as x)
+    """
+    B, N, _ = x.shape
+    M = y.shape[1]
+    device = x.device
+
+    min_dist = torch.full((B, N), float("inf"), device=device, dtype=x.dtype)
+    min_idx = torch.zeros((B, N), device=device, dtype=torch.long)
+
+    chunk_m = max(1, int(chunk_m))
+    for start in range(0, M, chunk_m):
+        end = min(start + chunk_m, M)
+        dist_chunk = compiled_cdist(x, y[:, start:end], max_batch=max_batch)
+        local_min_dist, local_min_idx = torch.min(dist_chunk, dim=-1)
+        better = local_min_dist < min_dist
+        min_dist = torch.where(better, local_min_dist, min_dist)
+        min_idx = torch.where(better, local_min_idx + start, min_idx)
+        del dist_chunk, local_min_dist, local_min_idx, better
+
+    return min_idx, min_dist
 
 def batched_kmeans(x: torch.Tensor, num_clusters: int, num_iters: int = 5, init_centroids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -75,8 +106,12 @@ def batched_kmeans(x: torch.Tensor, num_clusters: int, num_iters: int = 5, init_
     labels_offset = (torch.arange(B, device=device) * num_clusters).unsqueeze(1)
     
     for _ in range(num_iters):
-        dists = compiled_cdist(x, centroids)
-        labels = torch.argmin(dists, dim=-1)
+        labels, _ = chunked_argmin_cdist(
+            x,
+            centroids,
+            max_batch=16,
+            chunk_m=min(64, num_clusters),
+        )
         
         # Fast update using index_add_
         x_flat = x.flatten(0, 1)
@@ -123,6 +158,10 @@ class SFCDC_Simulator:
         self.l_h = l_h
         self.l_w = l_w
 
+        # Memory-oriented knobs
+        self.cdist_max_batch = int(kwargs.get("cdist_max_batch", 16))
+        self.assign_chunk_k = int(kwargs.get("assign_chunk_k", 64))
+
         # State cache for centroids
         self.offline_meta: Dict[Tuple, Dict[str, torch.Tensor]] = {}
 
@@ -167,7 +206,7 @@ class SFCDC_Simulator:
 
         # --- Phase 1: Clustering (Train / Warmup) ---
         if iter_idx < self.start_iter:
-            chunk_size = 16
+            chunk_size = 16 
             
             for start_b in range(0, B_all, chunk_size):
                 end_b = min(start_b + chunk_size, B_all)
@@ -218,7 +257,7 @@ class SFCDC_Simulator:
         out_all = torch.empty_like(q_all)
         inv_sqrt_d = 1.0 / math.sqrt(D)
         # [Memory] Smaller chunk to limit peak memory in _reassign_clusters_online
-        chunk_size = 16
+        chunk_size = 8
         
         for start_b in range(0, B_all, chunk_size):
             end_b = min(start_b + chunk_size, B_all)
@@ -284,7 +323,6 @@ class SFCDC_Simulator:
         k_real = ki_f * k_s_f.unsqueeze(-1)
         
         # --- NEW V4.3 LOGIC: Centroid Scaling ---
-        # "Clustering center calculation S_c metrix needs consider quan factor"
         # qc_scales: [B, Nc, 1]
         
         # Treat scales as a rank-3 tensor [B, L, 1] to reuse calculate_centroids
@@ -302,17 +340,30 @@ class SFCDC_Simulator:
         
         # Safety check for NaN/Inf
         if torch.isnan(sc).any() or torch.isinf(sc).any():
-            sc = torch.nan_to_num(sc, nan=0.0, posinf=1e4, neginf=-1e4)
+             sc = torch.nan_to_num(sc, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # Tier selection
-        sc_idx = torch.sort(sc, dim=-1, descending=True)[1]
         c0, c1, c2 = int(self.k0*self.centers_k), int(self.k1*self.centers_k), int(self.k2*self.centers_k)
-        
-        tier_table = torch.zeros_like(sc, dtype=torch.int32)
-        # Optimize scatter usage
-        tier_table.scatter_(2, sc_idx[:, :, :c0], 1)            # Tier 1: Exact
-        tier_table.scatter_(2, sc_idx[:, :, c0:c0+c1], 2)       # Tier 2: Comp
-        tier_table.scatter_(2, sc_idx[:, :, c0+c1:c0+c1+c2], 3) # Tier 3: Centroid
+
+        # Memory-efficient tier construction:
+        # when c0+c1+c2 covers all K-clusters, avoid full sort(sc) and use top-k only.
+        total_tier = min(self.centers_k, c0 + c1 + c2)
+        if total_tier >= self.centers_k:
+            tier_table = torch.full_like(sc, 3, dtype=torch.int32)  # default Tier 3
+            top12_k = min(self.centers_k, c0 + c1)
+            if top12_k > 0:
+                top12_idx = torch.topk(sc, k=top12_k, dim=-1, largest=True, sorted=True).indices
+                if c1 > 0 and c0 < top12_k:
+                    tier_table.scatter_(2, top12_idx[:, :, c0:top12_k], 2)  # Tier 2
+                if c0 > 0:
+                    tier_table.scatter_(2, top12_idx[:, :, :c0], 1)         # Tier 1
+        else:
+            # Fallback for partial coverage ratio settings
+            sc_idx = torch.sort(sc, dim=-1, descending=True)[1]
+            tier_table = torch.zeros_like(sc, dtype=torch.int32)
+            tier_table.scatter_(2, sc_idx[:, :, :c0], 1)
+            tier_table.scatter_(2, sc_idx[:, :, c0:c0+c1], 2)
+            tier_table.scatter_(2, sc_idx[:, :, c0+c1:c0+c1+c2], 3)
         
         # --- REORDERING & OPTIMIZATION ---
         # Sort indices based on cluster assignment
@@ -449,8 +500,6 @@ class SFCDC_Simulator:
             return torch.zeros(B_all, L, dtype=torch.int64, device=device)
 
         c_split = torch.split(centroids, k_repeats, dim=1)
-        # Pad centroids to have same number per group for batched matmul
-        c_g = torch.stack([F.pad(c, (0, 0, 0, max_k - c.size(1)), value=1e6) for c in c_split], dim=1)
         
         HW = H_dim * W_dim
         pad_size = (n_g * self.group_size * HW) - L
@@ -461,20 +510,23 @@ class SFCDC_Simulator:
             
         x_g = x_pad.view(B_all, n_g, -1, D)
         T_per_g = x_g.size(2)
-        
-        # Calculate distances
-        x_flat = x_g.contiguous().view(-1, T_per_g, D)
-        c_flat = c_g.contiguous().view(-1, max_k, D)
-        
-        # Ensure float for distance calculation
-        if x_flat.dtype == torch.int8:
-            x_flat = x_flat.float()
-            
-        dist = compiled_cdist(x_flat, c_flat) # [B*n_g, T, K]
-        
-        # Find min index
-        l_local = torch.argmin(dist, dim=-1) # [B*n_g, T]
-        l_local = l_local.view(B_all, n_g, T_per_g)
+
+        # Group-wise nearest search (same assignment objective, lower peak memory)
+        l_local_list = []
+        for gi in range(n_g):
+            xgi = x_g[:, gi]
+            cgi = c_split[gi]
+            if xgi.dtype == torch.int8:
+                xgi = xgi.float()
+            local_idx, _ = chunked_argmin_cdist(
+                xgi,
+                cgi,
+                max_batch=self.cdist_max_batch,
+                chunk_m=min(self.assign_chunk_k, cgi.size(1)),
+            )
+            l_local_list.append(local_idx)
+
+        l_local = torch.stack(l_local_list, dim=1).view(B_all, n_g, T_per_g)
         
         # Convert local centroid index to global index
         l_offset = torch.tensor([0] + k_repeats[:-1], device=device).cumsum(0).view(1, n_g, 1)

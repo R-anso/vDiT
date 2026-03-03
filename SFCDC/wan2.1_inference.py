@@ -3,8 +3,6 @@ import sys
 
 import argparse
 import logging
-import os
-import sys
 import warnings
 from datetime import datetime
 
@@ -14,57 +12,39 @@ import random
 
 import torch
 import torch.distributed as dist
+import torchvision
 from PIL import Image
+import imageio
 
 # Setup paths for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# 1. Add 'src' to path so 'SFCDC' can be imported by 'wan' modules
+# 1. Add 'src' to path so 'SFCDC' and 'SVG2' can be imported by 'wan' modules
 sys.path.append(os.path.dirname(current_dir))
-# 2. Add 'src/Wan2.2' to path so 'wan' can be imported directly
-sys.path.append(os.path.join(os.path.dirname(current_dir), 'Wan2.2'))
+# 2. Add 'src/Wan2.1' to path so 'wan' can be imported directly
+sys.path.append(os.path.join(os.path.dirname(current_dir), 'Wan2.1'))
 
 import wan
-from wan.textimage2video_sfcdc import WanTI2V as WanTI2V_SFCDC
+from wan.text2video_sfcdc import WanT2V as WanT2V_SFCDC
+from wan.image2video_sfcdc import WanI2V as WanI2V_SFCDC
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
-from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
-from wan.utils.utils import merge_video_audio, save_video, str2bool
+from wan.utils.utils import str2bool
+
+
+T2V_CKPT_DIR = "./Wan2.1/model/Wan2.1-T2V-14B"
+I2V_CKPT_DIR = "./Wan2.1/model/Wan2.1-I2V-14B-720P"
 
 
 EXAMPLE_PROMPT = {
-    "t2v-A14B": {
+    "t2v-14B": {
         "prompt":
             "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
     },
-    "i2v-A14B": {
+    "i2v-14B": {
         "prompt":
             "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside.",
         "image":
             "examples/i2v_input.JPG",
-    },
-    "ti2v-5B": {
-        "prompt":
-            "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
-    },
-    "animate-14B": {
-        "prompt": "视频中的人在做动作",
-        "video": "",
-        "pose": "",
-        "mask": "",
-    },
-    "s2v-14B": {
-        "prompt":
-            "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside.",
-        "image":
-            "examples/i2v_input.JPG",
-        "audio":
-            "examples/talk.wav",
-        "tts_prompt_audio":
-            "examples/zero_shot_prompt.wav",
-        "tts_prompt_text":
-            "希望你以后能够做的比我还好呦。",
-        "tts_text":
-            "收到好友从远方寄来的生日礼物，那份意外的惊喜与深深的祝福让我心中充满了甜蜜的快乐，笑容如花儿般绽放。"
     },
 }
 
@@ -79,37 +59,31 @@ def _validate_args(args):
         args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
     if args.image is None and "image" in EXAMPLE_PROMPT[args.task]:
         args.image = EXAMPLE_PROMPT[args.task]["image"]
-    if args.audio is None and args.enable_tts is False and "audio" in EXAMPLE_PROMPT[args.task]:
-        args.audio = EXAMPLE_PROMPT[args.task]["audio"]
-    if (args.tts_prompt_audio is None or args.tts_text is None) and args.enable_tts is True and "audio" in EXAMPLE_PROMPT[args.task]:
-        args.tts_prompt_audio = EXAMPLE_PROMPT[args.task]["tts_prompt_audio"]
-        args.tts_prompt_text = EXAMPLE_PROMPT[args.task]["tts_prompt_text"]
-        args.tts_text = EXAMPLE_PROMPT[args.task]["tts_text"]
 
-    if args.task == "i2v-A14B":
+    if args.task == "i2v-14B":
         assert args.image is not None, "Please specify the image path for i2v."
 
-    cfg = WAN_CONFIGS[args.task]
-
+    # The default sampling steps are 40 for i2v and 50 for t2v
     if args.sample_steps is None:
-        args.sample_steps = cfg.sample_steps
+        args.sample_steps = 50
+        if "i2v" in args.task:
+            args.sample_steps = 40
 
     if args.sample_shift is None:
-        args.sample_shift = cfg.sample_shift
-
-    if args.sample_guide_scale is None:
-        args.sample_guide_scale = cfg.sample_guide_scale
+        args.sample_shift = 5.0
+        if "i2v" in args.task and args.size in ["832*480", "480*832"]:
+            args.sample_shift = 3.0
 
     if args.frame_num is None:
-        args.frame_num = cfg.frame_num
+        args.frame_num = 81
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
+
     # Size check
-    if not 's2v' in args.task:
-        assert args.size in SUPPORTED_SIZES[
-            args.
-            task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
+    assert args.size in SUPPORTED_SIZES[
+        args.
+        task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
 
 
 def _load_prompt_assets_from_id(prompt_path, prompt_id, prompt_filename, image_filename):
@@ -147,9 +121,15 @@ def _get_all_prompt_ids(prompt_path):
     return sorted(numeric_ids)
 
 
+def _choose_task_and_ckpt(image_path):
+    if image_path is None:
+        return "t2v-14B", T2V_CKPT_DIR
+    return "i2v-14B", I2V_CKPT_DIR
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate a image or video from a text prompt or image using Wan"
+        description="Generate a video from text/image using Wan2.1 + SFCDC acceleration"
     )
     parser.add_argument(
         "--prompt_path",
@@ -190,38 +170,40 @@ def _parse_args():
     parser.add_argument(
         "--task",
         type=str,
-        default="t2v-A14B",
-        choices=list(WAN_CONFIGS.keys()),
+        default="t2v-14B",
+        choices=["t2v-14B", "t2v-1.3B", "i2v-14B"],
         help="The task to run.")
     parser.add_argument(
         "--size",
         type=str,
         default="1280*720",
         choices=list(SIZE_CONFIGS.keys()),
-        help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
-    )
+        help="The area (width*height) of the generated video.")
     parser.add_argument(
         "--frame_num",
         type=int,
         default=None,
-        help="How many frames of video are generated. The number should be 4n+1"
-    )
+        help="How many frames to sample. The number should be 4n+1")
     parser.add_argument(
         "--ckpt_dir",
         type=str,
         default=None,
-        help="The path to the checkpoint directory.")
+        help="The path to the Wan2.1 checkpoint directory. In prompt_id/all_id mode, it will be auto-selected by model type.")
     parser.add_argument(
         "--offload_model",
         type=str2bool,
         default=None,
-        help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage."
-    )
+        help="Whether to offload the model to CPU after each forward.")
     parser.add_argument(
         "--ulysses_size",
         type=int,
         default=1,
         help="The size of the ulysses parallelism in DiT.")
+    parser.add_argument(
+        "--ring_size",
+        type=int,
+        default=1,
+        help="The size of the ring attention parallelism in DiT.")
     parser.add_argument(
         "--t5_fsdp",
         action="store_true",
@@ -246,7 +228,7 @@ def _parse_args():
         "--overlap",
         action="store_true",
         default=False,
-        help="Whether to overwrite an existing output file. If disabled, appends suffix like _1."
+        help="Whether to overwrite an existing output file. If disabled, existing file will be skipped."
     )
     parser.add_argument(
         "--prompt",
@@ -284,7 +266,7 @@ def _parse_args():
         "--image",
         type=str,
         default=None,
-        help="The image to generate the video from.")
+        help="The image to generate the video from (for i2v).")
     parser.add_argument(
         "--sample_solver",
         type=str,
@@ -301,86 +283,9 @@ def _parse_args():
     parser.add_argument(
         "--sample_guide_scale",
         type=float,
-        default=None,
+        default=5.0,
         help="Classifier free guidance scale.")
-    parser.add_argument(
-        "--convert_model_dtype",
-        action="store_true",
-        default=False,
-        help="Whether to convert model paramerters dtype.")
 
-    # animate
-    parser.add_argument(
-        "--src_root_path",
-        type=str,
-        default=None,
-        help="The file of the process output path. Default None.")
-    parser.add_argument(
-        "--refert_num",
-        type=int,
-        default=77,
-        help="How many frames used for temporal guidance. Recommended to be 1 or 5."
-    )
-    parser.add_argument(
-        "--replace_flag",
-        action="store_true",
-        default=False,
-        help="Whether to use replace.")
-    parser.add_argument(
-        "--use_relighting_lora",
-        action="store_true",
-        default=False,
-        help="Whether to use relighting lora.")
-    
-    # following args only works for s2v
-    parser.add_argument(
-        "--num_clip",
-        type=int,
-        default=None,
-        help="Number of video clips to generate, the whole video will not exceed the length of audio."
-    )
-    parser.add_argument(
-        "--audio",
-        type=str,
-        default=None,
-        help="Path to the audio file, e.g. wav, mp3")
-    parser.add_argument(
-        "--enable_tts",
-        action="store_true",
-        default=False,
-        help="Use CosyVoice to synthesis audio")
-    parser.add_argument(
-        "--tts_prompt_audio",
-        type=str,
-        default=None,
-        help="Path to the tts prompt audio file, e.g. wav, mp3. Must be greater than 16khz, and between 5s to 15s.")
-    parser.add_argument(
-        "--tts_prompt_text",
-        type=str,
-        default=None,
-        help="Content to the tts prompt audio. If provided, must exactly match tts_prompt_audio")
-    parser.add_argument(
-        "--tts_text",
-        type=str,
-        default=None,
-        help="Text wish to synthesize")
-    parser.add_argument(
-        "--pose_video",
-        type=str,
-        default=None,
-        help="Provide Dw-pose sequence to do Pose Driven")
-    parser.add_argument(
-        "--start_from_ref",
-        action="store_true",
-        default=False,
-        help="whether set the reference image as the starting point for generation"
-    )
-    parser.add_argument(
-        "--infer_frames",
-        type=int,
-        default=81,
-        help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
-    )
     args = parser.parse_args()
 
     torch.cuda.manual_seed_all(42)
@@ -388,10 +293,36 @@ def _parse_args():
     return args
 
 
+def save_video(tensor, save_file, fps=16, value_range=(-1, 1)):
+    """
+    Save a video tensor to file. Replacement for cache_video that avoids
+    the dtype bug in the original retry loop (uint8 tensor on retry).
+    
+    Args:
+        tensor: [C, T, H, W] float tensor
+        save_file: output file path
+        fps: frames per second
+        value_range: (min, max) for normalization
+    """
+    # Ensure float32 for safe arithmetic
+    tensor = tensor.detach().float().cpu()
+    # Normalize from value_range to [0, 1]
+    low, high = value_range
+    tensor = tensor.clamp(low, high)
+    tensor = (tensor - low) / max(high - low, 1e-5)
+    # Convert to uint8 [T, H, W, C]
+    tensor = (tensor * 255).to(torch.uint8)
+    # [C, T, H, W] -> [T, H, W, C]
+    frames = tensor.permute(1, 2, 3, 0).numpy()
+
+    writer = imageio.get_writer(save_file, fps=fps, codec='libx264', quality=8)
+    for frame in frames:
+        writer.append_data(frame)
+    writer.close()
+
+
 def _init_logging(rank):
-    # logging
     if rank == 0:
-        # set format
         logging.basicConfig(
             level=logging.INFO,
             format="[%(asctime)s] %(levelname)s: %(message)s",
@@ -421,34 +352,9 @@ def generate(args):
     else:
         assert not (
             args.t5_fsdp or args.dit_fsdp
-        ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
-        assert not (
-            args.ulysses_size > 1
-        ), f"sequence parallel are not supported in non-distributed environments."
-
-    if args.ulysses_size > 1:
-        assert args.ulysses_size == world_size, f"The number of ulysses_size should be equal to the world size."
-        init_distributed_group()
-
-    if args.use_prompt_extend:
-        if args.prompt_extend_method == "dashscope":
-            prompt_expander = DashScopePromptExpander(
-                model_name=args.prompt_extend_model,
-                task=args.task,
-                is_vl=args.image is not None)
-        elif args.prompt_extend_method == "local_qwen":
-            prompt_expander = QwenPromptExpander(
-                model_name=args.prompt_extend_model,
-                task=args.task,
-                is_vl=args.image is not None,
-                device=rank)
-        else:
-            raise NotImplementedError(
-                f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
+        ), "t5_fsdp and dit_fsdp are not supported in non-distributed environments."
 
     cfg = WAN_CONFIGS[args.task]
-    if args.ulysses_size > 1:
-        assert cfg.num_heads % args.ulysses_size == 0, f"`{cfg.num_heads=}` cannot be divided evenly by `{args.ulysses_size=}`."
 
     logging.info(f"Generation job args: {args}")
     logging.info(f"Generation model config: {cfg}")
@@ -468,6 +374,21 @@ def generate(args):
     if args.use_prompt_extend:
         logging.info("Extending prompt ...")
         if rank == 0:
+            if args.prompt_extend_method == "dashscope":
+                prompt_expander = DashScopePromptExpander(
+                    model_name=args.prompt_extend_model,
+                    task=args.task,
+                    is_vl=args.image is not None)
+            elif args.prompt_extend_method == "local_qwen":
+                prompt_expander = QwenPromptExpander(
+                    model_name=args.prompt_extend_model,
+                    task=args.task,
+                    is_vl=args.image is not None,
+                    device=rank)
+            else:
+                raise NotImplementedError(
+                    f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
+
             prompt_output = prompt_expander(
                 args.prompt,
                 image=img,
@@ -489,20 +410,19 @@ def generate(args):
         logging.info(f"Extended prompt: {args.prompt}")
 
     if "t2v" in args.task:
-        logging.info("Creating WanT2V pipeline.")
-        wan_t2v = wan.WanT2V(
+        logging.info("Creating WanT2V pipeline (SFCDC).")
+        wan_t2v = WanT2V_SFCDC(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
             device_id=device,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
+            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
         )
 
-        logging.info(f"Generating video ...")
+        logging.info(f"Generating video with SFCDC acceleration...")
         video = wan_t2v.generate(
             args.prompt,
             size=SIZE_CONFIGS[args.size],
@@ -513,108 +433,20 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
-    elif "ti2v" in args.task:
-        logging.info("Creating WanTI2V pipeline (SFCDC).")
-        wan_ti2v = WanTI2V_SFCDC(
+    elif "i2v" in args.task:
+        logging.info("Creating WanI2V pipeline (SFCDC).")
+        wan_i2v = WanI2V_SFCDC(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
             device_id=device,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
             dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
+            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
         )
 
-        logging.info(f"Generating video ...")
-        video = wan_ti2v.generate(
-            args.prompt,
-            img=img,
-            size=SIZE_CONFIGS[args.size],
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
-    elif "animate" in args.task:
-        logging.info("Creating Wan-Animate pipeline.")
-        wan_animate = wan.WanAnimate(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-            use_relighting_lora=args.use_relighting_lora
-        )
-
-        logging.info(f"Generating video ...")
-        video = wan_animate.generate(
-            src_root_path=args.src_root_path,
-            replace_flag=args.replace_flag,
-            refert_num = args.refert_num,
-            clip_len=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
-    elif "s2v" in args.task:
-        logging.info("Creating WanS2V pipeline.")
-        wan_s2v = wan.WanS2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-        )
-        logging.info(f"Generating video ...")
-        video = wan_s2v.generate(
-            input_prompt=args.prompt,
-            ref_image_path=args.image,
-            audio_path=args.audio,
-            enable_tts=args.enable_tts,
-            tts_prompt_audio=args.tts_prompt_audio,
-            tts_prompt_text=args.tts_prompt_text,
-            tts_text=args.tts_text,
-            num_repeat=args.num_clip,
-            pose_video=args.pose_video,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            infer_frames=args.infer_frames,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model,
-            init_first_frame=args.start_from_ref,
-        )
-    else:
-        logging.info("Creating WanI2V pipeline.")
-        wan_i2v = wan.WanI2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-        )
-        logging.info("Generating video ...")
+        logging.info(f"Generating video with SFCDC acceleration...")
         video = wan_i2v.generate(
             args.prompt,
             img,
@@ -626,6 +458,8 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+    else:
+        raise NotImplementedError(f"Unsupported task for SFCDC: {args.task}")
 
     if rank == 0:
         if args.save_file is None:
@@ -633,21 +467,14 @@ def generate(args):
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
                                                                      "_")[:50]
             suffix = '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
+            args.save_file = f"sfcdc_{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{formatted_prompt}_{formatted_time}" + suffix
 
         logging.info(f"Saving generated video to {args.save_file}")
         save_video(
-            tensor=video[None],
+            tensor=video,
             save_file=args.save_file,
             fps=cfg.sample_fps,
-            nrow=1,
-            normalize=True,
             value_range=(-1, 1))
-        if "s2v" in args.task:
-            if args.enable_tts is False:
-                merge_video_audio(video_path=args.save_file, audio_path=args.audio)
-            else:
-                merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
     del video
 
     torch.cuda.synchronize()
@@ -683,13 +510,14 @@ if __name__ == "__main__":
                 prompt_filename=run_args.prompt_filename,
                 image_filename=run_args.image_filename,
             )
+            run_args.task, run_args.ckpt_dir = _choose_task_and_ckpt(run_args.image)
             run_args.save_file = os.path.join(run_args.all_video_path, f"{prompt_id}.mp4")
 
             if (not run_args.overlap) and os.path.exists(run_args.save_file):
                 print(f"Skip prompt_id={prompt_id}, file already exists: {run_args.save_file}")
                 continue
 
-            print(f"Loaded prompt for id={prompt_id}")
+            print(f"Loaded prompt for id={prompt_id}, task={run_args.task}")
             if run_args.image is not None:
                 print(f"Loaded image from {run_args.image}")
 
@@ -703,7 +531,8 @@ if __name__ == "__main__":
                 prompt_filename=args.prompt_filename,
                 image_filename=args.image_filename,
             )
-            print(f"Loaded prompt for id={args.prompt_id}")
+            args.task, args.ckpt_dir = _choose_task_and_ckpt(args.image)
+            print(f"Loaded prompt for id={args.prompt_id}, task={args.task}")
             if args.image is not None:
                 print(f"Loaded image from {args.image}")
 
